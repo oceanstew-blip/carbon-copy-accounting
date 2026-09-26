@@ -662,33 +662,7 @@ app.post("/api/close-month",async(req,res,next)=>{try{
 app.use((err,_req,res,_next)=>{console.error(err);if(err.code==="LIMIT_FILE_SIZE")return res.status(413).json({error:"Receipt must be under 20MB per image"});if(err.statusCode)return res.status(err.statusCode).json({error:err.message});res.status(500).json({error:"Server error"})});
 
 await init();
-const ONE_TIME_RECEIPT_REPAIR=await pool.connect();
-try{
-  await ONE_TIME_RECEIPT_REPAIR.query("BEGIN");
-  await ONE_TIME_RECEIPT_REPAIR.query("UPDATE receipts SET payment_method='credit_card' WHERE id IN (6,7,11) AND transaction_id IS NULL");
 
-  const r16=(await ONE_TIME_RECEIPT_REPAIR.query("SELECT * FROM receipts WHERE id=16 FOR UPDATE")).rows[0];
-  if(r16 && !r16.transaction_id && r16.payment_method==='cash' && r16.receipt_date && r16.vendor && r16.amount!==null){
-    let categoryId=r16.category_id||null;
-    if(!categoryId && /restaurant|grill|cafe|food|meal|taco|tea|coffee/i.test((r16.vendor||"")+"\n"+(r16.receipt_text||""))){
-      categoryId=(await ONE_TIME_RECEIPT_REPAIR.query("SELECT id FROM categories WHERE name='Provisions' LIMIT 1")).rows[0]?.id||null;
-    }
-    const tr=await ONE_TIME_RECEIPT_REPAIR.query(`INSERT INTO transactions(transaction_date,posted_date,vendor_raw,vendor_normalized,amount,category_id,card_id,source,external_id,status,payment_method,payment_reference,captain_reviewed)
-      VALUES($1,$1,$2,$2,$3,$4,NULL,'receipt-correction','receipt-repair-16','posted','cash',$5,$6)
-      ON CONFLICT(external_id) WHERE external_id IS NOT NULL DO NOTHING RETURNING id`,[
-        r16.receipt_date,r16.vendor,Number(r16.amount),categoryId,r16.payment_reference||null,Boolean(categoryId)
-      ]);
-    const tid=tr.rows[0]?.id||((await ONE_TIME_RECEIPT_REPAIR.query("SELECT id FROM transactions WHERE external_id='receipt-repair-16' LIMIT 1")).rows[0]?.id||null);
-    if(tid)await ONE_TIME_RECEIPT_REPAIR.query("UPDATE receipts SET transaction_id=$1,category_id=COALESCE(category_id,$2),review_required=false WHERE id=16",[tid,categoryId]);
-  }
-  await ONE_TIME_RECEIPT_REPAIR.query("COMMIT");
-  console.log("ONE_TIME_RECEIPT_REPAIR complete");
-}catch(e){
-  await ONE_TIME_RECEIPT_REPAIR.query("ROLLBACK");
-  console.error("ONE_TIME_RECEIPT_REPAIR failed",e);
-}finally{
-  ONE_TIME_RECEIPT_REPAIR.release();
-}
 
 
 
