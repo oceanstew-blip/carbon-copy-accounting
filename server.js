@@ -647,8 +647,9 @@ app.patch("/api/receipts/:id",async(req,res,next)=>{try{
   const paymentReference=b.payment_reference===undefined?current.payment_reference:String(b.payment_reference||"").trim()||null;
   if(!paymentMethod)return res.status(400).json({error:"Confirm the payment method before saving"});
 
-  await pool.query(`UPDATE receipts SET receipt_date=$1,vendor=$2,amount=$3,category_id=$4,receipt_text=$5,payment_method=$6,payment_reference=$7,review_required=false WHERE id=$8`,
-    [date,vendor,amount,categoryId,receiptText,paymentMethod,paymentReference,id]);
+  const correctedFileName=receiptFileName(vendor,date,amount,current.content_type,current.file_name);
+  await pool.query(`UPDATE receipts SET receipt_date=$1,vendor=$2,amount=$3,category_id=$4,receipt_text=$5,payment_method=$6,payment_reference=$7,review_required=false,file_name=$8 WHERE id=$9`,
+    [date,vendor,amount,categoryId,receiptText,paymentMethod,paymentReference,correctedFileName,id]);
 
   let createdTransactionId=null,matched=null;
   if(!current.transaction_id && paymentMethod!=="credit_card"){
@@ -664,6 +665,12 @@ app.patch("/api/receipts/:id",async(req,res,next)=>{try{
     if(createdTransactionId)await pool.query("UPDATE receipts SET transaction_id=$1,category_id=COALESCE(category_id,$2) WHERE id=$3",[createdTransactionId,chosenCategory,id]);
   }else if(!current.transaction_id && paymentMethod==="credit_card"){
     matched=await autoMatchReceipt(id);
+  }
+  if(paymentMethod!=="credit_card"){
+    const repaired=await repairOrphanNonCardReceipts();
+    const linked=(await pool.query("SELECT transaction_id FROM receipts WHERE id=$1",[id])).rows[0]?.transaction_id||null;
+    if(!linked)return res.status(500).json({error:"This receipt could not be posted to Transactions. It remains unsaved as an accounting transaction."});
+    createdTransactionId=createdTransactionId||Number(linked);
   }
   res.json({ok:true,created_transaction_id:createdTransactionId,matched_transaction_id:matched,payment_method:paymentMethod});
 }catch(e){next(e)}});
