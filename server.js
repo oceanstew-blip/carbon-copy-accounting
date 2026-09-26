@@ -2,6 +2,8 @@ import express from "express";
 import multer from "multer";
 import pg from "pg";
 import crypto from "crypto";
+import sharp from "sharp";
+import { createWorker } from "tesseract.js";
 import { capitalOneCsv, initialRules, driveReceipts } from "./seed.js";
 
 const {Pool}=pg;
@@ -22,6 +24,77 @@ function auth(req,res,next){
 app.use(auth);
 app.use(express.json({limit:"8mb"}));
 app.use(express.static("public"));
+
+
+let ocrWorkerPromise=null;
+async function getOcrWorker(){
+  if(!ocrWorkerPromise){
+    ocrWorkerPromise=createWorker("eng").catch((e)=>{ocrWorkerPromise=null;throw e});
+  }
+  return ocrWorkerPromise;
+}
+function isoReceiptDate(raw){
+  if(!raw)return null;
+  let m=String(raw).match(/\b(20\d{2})[-\/.](\d{1,2})[-\/.](\d{1,2})\b/);
+  if(m)return [m[1],String(m[2]).padStart(2,"0"),String(m[3]).padStart(2,"0")].join("-");
+  m=String(raw).match(/\b(\d{1,2})[-\/.](\d{1,2})[-\/.](20\d{2}|\d{2})\b/);
+  if(!m)return null;
+  let y=Number(m[3]);if(y<100)y+=2000;
+  const mo=Number(m[1]),d=Number(m[2]);
+  if(mo<1||mo>12||d<1||d>31)return null;
+  return [y,String(mo).padStart(2,"0"),String(d).padStart(2,"0")].join("-");
+}
+function amountFromLine(line){
+  const vals=[...String(line).matchAll(/(?:\$\s*)?(-?\d{1,6}(?:,\d{3})*\.\d{2})\b/g)]
+    .map((m)=>Number(m[1].replace(/,/g,""))).filter(Number.isFinite);
+  return vals.length?vals[vals.length-1]:null;
+}
+function suggestedCategoryFromText(text){
+  const t=String(text||"").toLowerCase();
+  if(/\b(diver|diving|bottom clean|underwater|zinc|hubbell|plug|cable|pump|hose|clamp|sealant|hardware|acetone|mineral spirits|handrail|gate|repair|maintenance|part|parts|engine room)\b/i.test(t))return "Repairs & Maintenance";
+  if(/\b(food|grocery|groceries|meal|restaurant|cafe|coffee|snack|beverage|water|provision|provisions|market|publix|whole foods|trader joe)\b/i.test(t))return "Provisions";
+  if(/\b(starlink|internet|wifi|directv|television|phone|cellular|communications)\b/i.test(t))return "Communications / Internet";
+  if(/\b(dock|dockage|marina|slip|berth|yacht club|storage)\b/i.test(t))return "Dockage / Marina";
+  if(/\b(customs|dtops|decal|port fee|entry fee)\b/i.test(t))return "Customs / Port Fees";
+  if(/\b(office|paper|printer|ink|staples|notebook)\b/i.test(t))return "Supplies";
+  if(/\b(weather|routing|forecast|buoyweather|weatherbell)\b/i.test(t))return "Navigation / Weather";
+  if(/\b(uber|lyft|taxi|rideshare)\b/i.test(t))return "Transportation";
+  if(/\b(fuel|diesel|gasoline|gas station|racetrac|wawa|lubricant|oil)\b/i.test(t))return "Fuel & Lubricants";
+  return null;
+}
+function parseOcrReceipt(text){
+  const lines=String(text||"").split(/\r?\n/).map((x)=>x.replace(/\s+/g," ").trim()).filter(Boolean);
+  const totalPriority=[
+    /\bgrand\s*total\b/i,/\bamount\s*due\b/i,/\bbalance\s*due\b/i,/\btotal\b/i
+  ];
+  let amount=null;
+  for(const re of totalPriority){
+    const candidates=lines.filter((line)=>re.test(line)&&!/subtotal/i.test(line));
+    for(let i=candidates.length-1;i>=0;i--){const a=amountFromLine(candidates[i]);if(a!==null){amount=a;break}}
+    if(amount!==null)break;
+  }
+  if(amount===null){
+    const all=lines.flatMap((line)=>{const a=amountFromLine(line);return a===null?[]:[a]})
+      .filter((n)=>n>=0&&n<1000000);
+    if(all.length)amount=Math.max(...all);
+  }
+  let receipt_date=null;
+  for(const line of lines){receipt_date=isoReceiptDate(line);if(receipt_date)break}
+  const reject=/\b(receipt|invoice|thank you|welcome|www\.|http|tel\b|phone\b|date\b|time\b|cashier\b|register\b|transaction\b|order\b|subtotal\b|total\b|tax\b|visa\b|mastercard\b|amex\b)\b/i;
+  const vendor=lines.slice(0,12).find((line)=>
+    line.length>=3&&line.length<=70&&!reject.test(line)&&
+    !/^\W*[\d\s#()+.\/-]+\W*$/.test(line)&&
+    !/^\d+\s+\w+\s+(st|street|ave|avenue|rd|road|blvd|drive|dr)\b/i.test(line)
+  )||null;
+  return {vendor,receipt_date,amount,receipt_text:lines.join("\n"),suggested_category:suggestedCategoryFromText(text)};
+}
+async function ocrImage(buffer){
+  const prepared=await sharp(buffer,{failOn:"none"}).rotate().resize({width:2200,height:2200,fit:"inside",withoutEnlargement:true}).grayscale().normalize().png().toBuffer();
+  const worker=await getOcrWorker();
+  const result=await worker.recognize(prepared);
+  const parsed=parseOcrReceipt(result?.data?.text||"");
+  return {...parsed,confidence:Math.round(Number(result?.data?.confidence)||0)};
+}
 
 function monthBounds(month){
   const m=/^\d{4}-\d{2}$/.test(month||"")?month:new Date().toISOString().slice(0,7);
@@ -147,6 +220,18 @@ async function matchAllReceipts(){
 }
 
 app.get("/health",(_req,res)=>res.json({ok:true}));
+
+
+app.get("/api/ocr/status",(_req,res)=>res.json({enabled:true,mode:"server-side",engine:"tesseract",formats:["JPG","PNG","WEBP","HEIC","HEIF"],manual_fallback:true}));
+
+app.post("/api/ocr",upload.single("file"),async(req,res,next)=>{try{
+  const f=req.file;if(!f)return res.status(400).json({error:"Receipt image required"});
+  if(f.mimetype==="application/pdf")return res.status(422).json({error:"PDF OCR is not enabled yet. You can still enter the receipt fields manually."});
+  const allowed=["image/jpeg","image/png","image/webp","image/heic","image/heif","application/octet-stream"];
+  if(!allowed.includes(f.mimetype))return res.status(415).json({error:"OCR supports JPG, PNG, WEBP, HEIC and HEIF images"});
+  const data=await ocrImage(f.buffer);
+  res.json(data);
+}catch(e){next(e)}});
 
 app.get("/api/bootstrap",async(_req,res,next)=>{try{
   const [c,cd,r]=await Promise.all([
