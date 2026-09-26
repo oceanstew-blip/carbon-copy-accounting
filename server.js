@@ -256,8 +256,17 @@ app.post("/api/receipts",upload.single("file"),async(req,res,next)=>{try{
   const tid=req.body.transaction_id?Number(req.body.transaction_id):null;
   const date=req.body.receipt_date||null,vendor=String(req.body.vendor||"").trim()||null,amount=moneyNum(req.body.amount),cat=req.body.category_id?Number(req.body.category_id):null,receiptText=String(req.body.receipt_text||"").trim()||null;
   let inferredCat=Number.isFinite(cat)?cat:null;
-  if(!inferredCat && /\b(diver|diving|bottom clean|underwater)\b/i.test(receiptText||"")){
-    inferredCat=(await pool.query("SELECT id FROM categories WHERE name='Repairs & Maintenance' LIMIT 1")).rows[0]?.id||null;
+  if(!inferredCat){
+    const txt=(receiptText||"").toLowerCase();
+    let inferredName=null;
+    if(/\b(diver|diving|bottom clean|underwater|hubbell|plug|cable|pump|hardware|acetone|mineral spirits|handrail|gate|repair|maintenance|part|parts)\b/i.test(txt)) inferredName="Repairs & Maintenance";
+    else if(/\b(food|grocery|groceries|meal|restaurant|coffee|snack|beverage|water|provision|provisions)\b/i.test(txt)) inferredName="Provisions";
+    else if(/\b(starlink|internet|wifi|directv|television|phone|cellular|communications)\b/i.test(txt)) inferredName="Communications / Internet";
+    else if(/\b(dock|dockage|marina|slip|storage)\b/i.test(txt)) inferredName="Dockage / Marina";
+    else if(/\b(customs|dtops|decal|port fee|entry fee)\b/i.test(txt)) inferredName="Customs / Port Fees";
+    else if(/\b(office|paper|printer|ink|staple|staples|notebook)\b/i.test(txt)) inferredName="Supplies";
+    else if(/\b(weather|routing|forecast|buoyweather|weatherbell)\b/i.test(txt)) inferredName="Navigation / Weather";
+    if(inferredName) inferredCat=(await pool.query("SELECT id FROM categories WHERE name=$1 LIMIT 1",[inferredName])).rows[0]?.id||null;
   }
   const q=await pool.query(`INSERT INTO receipts(transaction_id,file_name,content_type,file_size,file_data,receipt_date,vendor,amount,category_id,file_sha256,receipt_text,expires_at)
     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW()+INTERVAL '60 days') RETURNING id,file_name,expires_at`,[Number.isFinite(tid)?tid:null,f.originalname,f.mimetype,f.size,f.buffer,date,vendor,amount,inferredCat,sha,receiptText]);
