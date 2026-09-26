@@ -172,6 +172,48 @@ async function ocrImage(buffer){
   const bottom=parseOcrReceipt(bottomResult?.data?.text||"");
   return mergeOcrFields(full,top,bottom,fullResult?.data?.confidence);
 }
+async function combineReceiptImages(files){
+  if(!files?.length)throw new Error("No receipt images");
+  if(files.length===1)return {buffer:files[0].buffer,content_type:files[0].mimetype,file_name:files[0].originalname};
+  if(files.some((f)=>f.mimetype==="application/pdf"))throw Object.assign(new Error("Multi-image receipt bundles must be images, not PDFs"),{statusCode:422});
+  const normalized=[];
+  let maxWidth=0,totalHeight=0;
+  for(const f of files){
+    const buf=await sharp(f.buffer,{failOn:"none"}).rotate().resize({width:1800,fit:"inside",withoutEnlargement:true}).png().toBuffer();
+    const m=await sharp(buf).metadata();
+    normalized.push({buf,width:m.width,height:m.height});
+    maxWidth=Math.max(maxWidth,m.width||0);
+  }
+  const gap=24;
+  totalHeight=normalized.reduce((sum,x)=>sum+(x.height||0),0)+gap*(normalized.length-1);
+  let top=0;
+  const composite=[];
+  for(const x of normalized){
+    composite.push({input:x.buf,left:Math.round((maxWidth-x.width)/2),top});
+    top+=(x.height||0)+gap;
+  }
+  const buffer=await sharp({create:{width:maxWidth,height:totalHeight,channels:3,background:"white"}}).composite(composite).png().toBuffer();
+  return {buffer,content_type:"image/png",file_name:`receipt-bundle-${files.length}-images.png`};
+}
+function mergeReceiptPages(pages){
+  const fullText=pages.map((p,i)=>`--- PAGE ${i+1} ---\n${p.receipt_text||""}`).join("\n");
+  const vendor=pages.find((p)=>p.vendor)?.vendor||null;
+  const receipt_date=pages.find((p)=>p.receipt_date)?.receipt_date||null;
+  const amount=[...pages].reverse().find((p)=>p.amount!==null&&p.amount!==undefined)?.amount??null;
+  const detected_payment_method=[...pages].reverse().find((p)=>p.detected_payment_method)?.detected_payment_method||null;
+  const suggested_category=suggestedCategoryFromText(fullText);
+  const subtotal=[...pages].reverse().find((p)=>p.subtotal!==null&&p.subtotal!==undefined)?.subtotal??null;
+  const tax=[...pages].reverse().find((p)=>p.tax!==null&&p.tax!==undefined)?.tax??null;
+  const total_verified=pages.some((p)=>p.total_verified);
+  const confidence=Math.round(pages.reduce((sum,p)=>sum+(Number(p.confidence)||0),0)/Math.max(1,pages.length));
+  return mergeOcrFields(
+    {vendor,receipt_date,amount,subtotal,tax,total_verified,receipt_text:fullText,suggested_category,detected_payment_method},
+    {vendor,receipt_date},
+    {amount,subtotal,tax,total_verified,suggested_category,detected_payment_method},
+    confidence
+  );
+}
+
 function monthBounds(month){
   const m=/^\d{4}-\d{2}$/.test(month||"")?month:new Date().toISOString().slice(0,7);
   const [y,mo]=m.split("-").map(Number);
@@ -323,14 +365,20 @@ app.get("/api/ocr/self-test",async(_req,res,next)=>{try{
 }catch(e){next(e)}});
 
 
-app.post("/api/ocr",upload.single("file"),async(req,res,next)=>{try{
-  const f=req.file;if(!f)return res.status(400).json({error:"Receipt image required"});
-  if(f.mimetype==="application/pdf")return res.status(422).json({error:"PDF OCR is not enabled yet. You can still enter the receipt fields manually."});
+app.post("/api/ocr",upload.any(),async(req,res,next)=>{try{
+  const files=req.files||[];if(!files.length)return res.status(400).json({error:"Receipt image required"});
+  if(files.some((f)=>f.mimetype==="application/pdf")){
+    if(files.length>1)return res.status(422).json({error:"Multi-page bundles currently support image photos only. Upload PDF receipts one at a time."});
+    return res.status(422).json({error:"PDF OCR is not enabled yet. You can still enter the receipt fields manually."});
+  }
   const allowed=["image/jpeg","image/png","image/webp","image/heic","image/heif","application/octet-stream"];
-  if(!allowed.includes(f.mimetype))return res.status(415).json({error:"OCR supports JPG, PNG, WEBP, HEIC and HEIF images"});
-  const data=await ocrImage(f.buffer);
-  res.json(data);
+  if(files.some((f)=>!allowed.includes(f.mimetype)))return res.status(415).json({error:"OCR supports JPG, PNG, WEBP, HEIC and HEIF images"});
+  const pages=[];
+  for(const f of files)pages.push(await ocrImage(f.buffer));
+  const data=pages.length===1?pages[0]:mergeReceiptPages(pages);
+  res.json({...data,page_count:files.length});
 }catch(e){next(e)}});
+
 
 app.get("/api/bootstrap",async(_req,res,next)=>{try{
   const [c,cd,r]=await Promise.all([
@@ -434,10 +482,12 @@ app.get("/api/receipt-inbox",async(_req,res,next)=>{try{
   res.json({rows:q.rows})
 }catch(e){next(e)}});
 
-app.post("/api/receipts",upload.single("file"),async(req,res,next)=>{try{
-  const f=req.file;if(!f)return res.status(400).json({error:"Receipt file required"});
+app.post("/api/receipts",upload.any(),async(req,res,next)=>{try{
+  const files=req.files||[];if(!files.length)return res.status(400).json({error:"Receipt file required"});
   const allowed=["image/jpeg","image/png","image/webp","image/heic","image/heif","application/pdf","application/octet-stream"];
-  if(!allowed.includes(f.mimetype))return res.status(415).json({error:"Use JPG, PNG, WEBP, HEIC, HEIF or PDF"});
+  if(files.some((f)=>!allowed.includes(f.mimetype)))return res.status(415).json({error:"Use JPG, PNG, WEBP, HEIC, HEIF or PDF"});
+  const combined=await combineReceiptImages(files);
+  const f={buffer:combined.buffer,mimetype:combined.content_type,originalname:combined.file_name,size:combined.buffer.length};
   const sha=crypto.createHash("sha256").update(f.buffer).digest("hex");
   let tid=req.body.transaction_id?Number(req.body.transaction_id):null;
   const date=req.body.receipt_date||null,vendor=String(req.body.vendor||"").trim()||null,amount=moneyNum(req.body.amount),cat=req.body.category_id?Number(req.body.category_id):null,receiptText=String(req.body.receipt_text||"").trim()||null;
@@ -563,7 +613,7 @@ app.post("/api/close-month",async(req,res,next)=>{try{
   res.json({closed:true,month})
 }catch(e){next(e)}});
 
-app.use((err,_req,res,_next)=>{console.error(err);if(err.code==="LIMIT_FILE_SIZE")return res.status(413).json({error:"Receipt must be under 20MB"});res.status(500).json({error:"Server error"})});
+app.use((err,_req,res,_next)=>{console.error(err);if(err.code==="LIMIT_FILE_SIZE")return res.status(413).json({error:"Receipt must be under 20MB per image"});if(err.statusCode)return res.status(err.statusCode).json({error:err.message});res.status(500).json({error:"Server error"})});
 
 await init();
 app.listen(port,"0.0.0.0",()=>console.log(`Carbon Copy Accounting listening on ${port}`));
