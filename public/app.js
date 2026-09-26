@@ -169,9 +169,10 @@ async function loadReceiptInbox(){
     showReceiptInline(btn.dataset.id);
   }));
 
-  $$('.edit-receipt').forEach((btn)=>btn.addEventListener('click',()=>{
+  $('.edit-receipt').forEach((btn)=>btn.addEventListener('click',()=>{
     const r=receiptInbox.find((x)=>String(x.id)===String(btn.dataset.id));
     if(!r)return;
+    resetReceiptReview();
     editingReceiptId=r.id;
     $('#rFile').value='';
     $('#rDate').value=String(r.receipt_date||'').slice(0,10);
@@ -456,9 +457,13 @@ function wireStaticControls(){
       else if(r.matched_transaction_id) msg='Corrected and matched to the credit-card transaction.';
       else if(payment==='credit_card') msg='Corrected. Waiting for the matching credit-card transaction.';
       $('#receiptUploadStatus').innerHTML='<p class="ok">'+esc(msg)+'</p>';
-      editingReceiptId=null;
-      $('#uploadReceipt').textContent='Confirm & Save Expense';
+      const correctedDate=$('#rDate').value;
+      const correctedPayment=r.payment_method||payment;
+      resetReceiptReview();
+      $('#receiptUploadStatus').innerHTML='<p class="ok">'+esc(msg)+'</p>';
+      if(['cash','check','wire'].includes(correctedPayment)&&correctedDate&&$('#month')) $('#month').value=correctedDate.slice(0,7);
       await Promise.all([loadReceiptInbox(),loadTransactions(),loadDashboard()]);
+      if(['cash','check','wire'].includes(correctedPayment)) showView('transactions');
       return;
     }
 
