@@ -135,15 +135,28 @@ function bindTransactionControls(){
 async function loadReceiptInbox(){
   const d=await api('receipt-inbox');
   receiptInbox=d.rows||[];
-  const el=$('#receiptInbox'); if(!el) return;
-  el.innerHTML=receiptInbox.length?receiptInbox.map((r)=>{
-    const paymentNames={credit_card:'Credit Card',cash:'Cash',wire:'Wire',check:'Check'};
+  const waiting=$('#receiptWaiting'),review=$('#receiptReview');
+  if(!waiting||!review) return;
+
+  const paymentNames={credit_card:'Credit Card',cash:'Cash',wire:'Wire',check:'Check'};
+  const renderItem=(r,showFix)=>{
+    const reasons=String(r.ocr_review_reasons||'').split(',').filter(Boolean);
+    const quality=r.ocr_field_score!=null
+      ? '<div class="muted">OCR key fields: '+esc(r.ocr_field_score)+'/5'+(reasons.length?' · Check '+esc(reasons.join(', ')):'')+'</div>'
+      : '';
     return '<div class="receipt-item"><b>'+esc(r.vendor||r.file_name||'Receipt')+'</b>'+
       '<div class="muted">'+esc(String(r.receipt_date||'No date').slice(0,10))+' · '+(r.amount==null?'No amount':money(r.amount))+
       ' · '+esc(paymentNames[r.payment_method]||'Payment not confirmed')+'</div>'+
+      quality+
       '<div><span class="badge">'+esc(r.category_name||'Uncategorized')+'</span> · <a target="_blank" href="/api/receipts/'+r.id+'">'+esc(r.file_name||'Receipt')+'</a></div>'+
-      '<div class="row"><button class="edit-receipt" data-id="'+r.id+'">Review / Fix</button></div></div>';
-  }).join(''):'<p class="muted">Nothing waiting. All card receipts are matched.</p>';
+      (showFix?'<div class="row"><button class="edit-receipt" data-id="'+r.id+'">Review / Fix</button></div>':'<div class="row"><button class="edit-receipt" data-id="'+r.id+'">Review / Fix</button></div>')+
+      '</div>';
+  };
+
+  const waitingRows=receiptInbox.filter((r)=>r.bucket==='waiting');
+  const reviewRows=receiptInbox.filter((r)=>r.bucket!=='waiting');
+  waiting.innerHTML=waitingRows.length?waitingRows.map((r)=>renderItem(r,false)).join(''):'<p class="muted">No credit-card receipts waiting to match.</p>';
+  review.innerHTML=reviewRows.length?reviewRows.map((r)=>renderItem(r,true)).join(''):'<p class="muted">Nothing needs review.</p>';
 
   $$('.edit-receipt').forEach((btn)=>btn.addEventListener('click',()=>{
     const r=receiptInbox.find((x)=>String(x.id)===String(btn.dataset.id));
@@ -158,8 +171,8 @@ async function loadReceiptInbox(){
     $('#rText').value=r.receipt_text||'';
     $('#rCategory').value=r.category_id?String(r.category_id):'';
     $('#ocrStatus').className='warn';
-    $('#ocrStatus').textContent='Reviewing an existing waiting receipt. Correct any field below, confirm payment method, then save.';
-    $('#reviewPrompt').textContent='Editing waiting receipt #'+r.id+'. Your corrections will replace the extracted values.';
+    $('#ocrStatus').textContent='Reviewing an existing receipt. Correct any field below, confirm payment method, then save.';
+    $('#reviewPrompt').textContent='Editing receipt #'+r.id+'. Your corrections will replace the extracted values.';
     $('#uploadReceipt').textContent='Save Corrections';
     window.scrollTo({top:document.getElementById('receipts').offsetTop,behavior:'smooth'});
   }));
@@ -213,15 +226,12 @@ async function runReceiptOcr(file){
       const cat=(bootstrap.categories||[]).find((c)=>c.name===r.suggested_category);
       if(cat)$('#rCategory').value=String(cat.id);
     }
-    const missing=[];
-    if(!r.vendor)missing.push('vendor');
-    if(!r.receipt_date)missing.push('date');
-    if(r.amount==null)missing.push('amount');
-    if(!r.detected_payment_method)missing.push('payment method');
+    const missing=Array.isArray(r.review_reasons)?r.review_reasons:[];
+    const score=Number(r.field_score)||0;
     status.className=missing.length?'warn':'ok';
     status.textContent=missing.length
-      ? 'OCR read the receipt, but you must review it. Check '+missing.join(', ')+'. OCR confidence '+(Number(r.confidence)||0)+'%. Nothing has been saved.'
-      : 'Receipt extracted. OCR confidence '+(Number(r.confidence)||0)+'%. Review every field below, then click Confirm & Save Expense. Nothing has been saved yet.';
+      ? score+'/5 key fields found. Review '+missing.join(', ')+'. Nothing has been saved.'
+      : '5/5 key fields found. Review the extracted values, then click Confirm & Save Expense. Nothing has been saved yet.';
   }catch(e){
     console.error(e);
     status.className='warn';
