@@ -60,6 +60,8 @@ async function init(){
     ALTER TABLE receipts ADD COLUMN IF NOT EXISTS receipt_text TEXT;
     ALTER TABLE receipts ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
     ALTER TABLE receipts ADD COLUMN IF NOT EXISTS purged_at TIMESTAMPTZ;
+    ALTER TABLE receipts ADD COLUMN IF NOT EXISTS payment_method TEXT;
+    ALTER TABLE receipts ADD COLUMN IF NOT EXISTS payment_reference TEXT;
     ALTER TABLE receipts ALTER COLUMN file_data DROP NOT NULL;
     ALTER TABLE transactions ADD COLUMN IF NOT EXISTS payment_method TEXT NOT NULL DEFAULT 'credit_card';
     ALTER TABLE transactions ADD COLUMN IF NOT EXISTS payment_reference TEXT;
@@ -117,7 +119,7 @@ async function seedInitialData(){
 }
 async function autoMatchReceipt(receiptId){
   const r=(await pool.query("SELECT * FROM receipts WHERE id=$1",[receiptId])).rows[0];
-  if(!r||r.transaction_id||r.amount==null||!r.receipt_date)return null;
+  if(!r||r.transaction_id||r.amount==null||!r.receipt_date||r.payment_method&&r.payment_method!=="credit_card")return null;
   const q=await pool.query(`
     SELECT t.id,t.transaction_date,t.vendor_raw,t.amount,
       ABS(t.transaction_date-$2::date) day_gap
@@ -296,9 +298,9 @@ app.post("/api/receipts",upload.single("file"),async(req,res,next)=>{try{
       ON CONFLICT DO NOTHING RETURNING id`,[date,vendor,amount,chosenCategory,ext,paymentMethod,paymentReference,Boolean(chosenCategory)]);
     tid=tr.rows[0]?.id||((await pool.query("SELECT id FROM transactions WHERE external_id=$1 LIMIT 1",[ext])).rows[0]?.id||null);
   }
-  const q=await pool.query(`INSERT INTO receipts(transaction_id,file_name,content_type,file_size,file_data,receipt_date,vendor,amount,category_id,file_sha256,receipt_text,expires_at)
-    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW()+INTERVAL '60 days') RETURNING id,file_name,expires_at`,[Number.isFinite(tid)?tid:null,f.originalname,f.mimetype,f.size,f.buffer,date,vendor,amount,inferredCat,sha,receiptText]);
-  const matched=await autoMatchReceipt(q.rows[0].id);
+  const q=await pool.query(`INSERT INTO receipts(transaction_id,file_name,content_type,file_size,file_data,receipt_date,vendor,amount,category_id,file_sha256,receipt_text,expires_at,payment_method,payment_reference)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW()+INTERVAL '60 days',$12,$13) RETURNING id,file_name,expires_at`,[Number.isFinite(tid)?tid:null,f.originalname,f.mimetype,f.size,f.buffer,date,vendor,amount,inferredCat,sha,receiptText,paymentMethod,paymentReference]);
+  const matched=paymentMethod==="credit_card"?await autoMatchReceipt(q.rows[0].id):null;
   res.status(201).json({...q.rows[0],matched_transaction_id:matched,created_transaction_id:Number.isFinite(tid)?tid:null,payment_method:paymentMethod})
 }catch(e){next(e)}});
 
