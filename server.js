@@ -251,12 +251,28 @@ app.post("/api/receipts",upload.single("file"),async(req,res,next)=>{try{
   const allowed=["image/jpeg","image/png","image/webp","image/heic","image/heif","application/pdf","application/octet-stream"];
   if(!allowed.includes(f.mimetype))return res.status(415).json({error:"Use JPG, PNG, WEBP, HEIC, HEIF or PDF"});
   const sha=crypto.createHash("sha256").update(f.buffer).digest("hex");
-  const existing=(await pool.query("SELECT id,transaction_id FROM receipts WHERE file_sha256=$1",[sha])).rows[0];
-  if(existing)return res.status(200).json({id:existing.id,duplicate:true,transaction_id:existing.transaction_id});
   let tid=req.body.transaction_id?Number(req.body.transaction_id):null;
   const date=req.body.receipt_date||null,vendor=String(req.body.vendor||"").trim()||null,amount=moneyNum(req.body.amount),cat=req.body.category_id?Number(req.body.category_id):null,receiptText=String(req.body.receipt_text||"").trim()||null;
   const paymentMethod=["credit_card","wire","check","cash"].includes(req.body.payment_method)?req.body.payment_method:"credit_card";
   const paymentReference=String(req.body.payment_reference||"").trim()||null;
+  const existing=(await pool.query("SELECT * FROM receipts WHERE file_sha256=$1",[sha])).rows[0];
+  if(existing){
+    if(!existing.transaction_id && paymentMethod!=="credit_card"){
+      const useDate=date||existing.receipt_date,useVendor=vendor||existing.vendor,useAmount=amount??(existing.amount==null?null:Number(existing.amount));
+      if(useDate&&useVendor&&useAmount!==null){
+        const chosenCategory=Number.isFinite(cat)?cat:(existing.category_id||null);
+        const ext=crypto.createHash("sha256").update([useDate,paymentMethod,paymentReference||"",String(useVendor).toUpperCase(),Number(useAmount).toFixed(2)].join("|")).digest("hex");
+        const tr=await pool.query(`INSERT INTO transactions(transaction_date,posted_date,vendor_raw,vendor_normalized,amount,category_id,card_id,source,external_id,status,payment_method,payment_reference,captain_reviewed)
+          VALUES($1,$1,$2,$2,$3,$4,NULL,'manual',$5,'posted',$6,$7,$8) ON CONFLICT DO NOTHING RETURNING id`,[useDate,useVendor,useAmount,chosenCategory,ext,paymentMethod,paymentReference,Boolean(chosenCategory)]);
+        const newTid=tr.rows[0]?.id||((await pool.query("SELECT id FROM transactions WHERE external_id=$1 LIMIT 1",[ext])).rows[0]?.id||null);
+        if(newTid){
+          await pool.query("UPDATE receipts SET transaction_id=$1,receipt_date=COALESCE(receipt_date,$2),vendor=COALESCE(vendor,$3),amount=COALESCE(amount,$4),category_id=COALESCE(category_id,$5),receipt_text=COALESCE(receipt_text,$6) WHERE id=$7",[newTid,useDate,useVendor,useAmount,chosenCategory,receiptText,existing.id]);
+          return res.status(200).json({id:existing.id,duplicate:true,promoted:true,created_transaction_id:newTid,payment_method:paymentMethod});
+        }
+      }
+    }
+    return res.status(200).json({id:existing.id,duplicate:true,transaction_id:existing.transaction_id,payment_method:paymentMethod});
+  }
   let inferredCat=Number.isFinite(cat)?cat:null;
   if(!inferredCat){
     const txt=(receiptText||"").toLowerCase();
