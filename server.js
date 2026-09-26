@@ -616,4 +616,14 @@ app.post("/api/close-month",async(req,res,next)=>{try{
 app.use((err,_req,res,_next)=>{console.error(err);if(err.code==="LIMIT_FILE_SIZE")return res.status(413).json({error:"Receipt must be under 20MB per image"});if(err.statusCode)return res.status(err.statusCode).json({error:err.message});res.status(500).json({error:"Server error"})});
 
 await init();
+const auditRecentReceipts=await pool.query(`
+  SELECT r.id receipt_id,r.created_at,r.vendor,r.amount,r.payment_method,r.transaction_id,r.file_name,
+         t.source transaction_source,t.vendor_raw transaction_vendor,t.amount transaction_amount,t.payment_method transaction_payment
+  FROM receipts r
+  LEFT JOIN transactions t ON t.id=r.transaction_id
+  WHERE r.created_at >= TIMESTAMPTZ '2026-09-26 16:30:00+00'
+  ORDER BY r.id
+`);
+console.log("TEST_RECEIPT_AUDIT",JSON.stringify(auditRecentReceipts.rows));
+
 app.listen(port,"0.0.0.0",()=>console.log(`Carbon Copy Accounting listening on ${port}`));
