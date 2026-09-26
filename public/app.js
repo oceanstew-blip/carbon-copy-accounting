@@ -228,7 +228,7 @@ function renderRules(){
       '<button class="delete-category" data-id="'+c.id+'" type="button">Delete</button>'+
       '</div></div>'
     ).join('');
-    $('.edit-category').forEach((btn)=>btn.addEventListener('click',async()=>{
+    $$('.edit-category').forEach((btn)=>btn.addEventListener('click',async()=>{
       const c=(bootstrap.categories||[]).find((x)=>String(x.id)===String(btn.dataset.id));if(!c)return;
       const name=window.prompt('Rename category:',c.name);
       if(name===null||!name.trim()||name.trim()===c.name)return;
@@ -239,7 +239,7 @@ function renderRules(){
         toast('Category renamed');
       }catch(e){toast(e.message)}
     }));
-    $('.delete-category').forEach((btn)=>btn.addEventListener('click',async()=>{
+    $$('.delete-category').forEach((btn)=>btn.addEventListener('click',async()=>{
       const c=(bootstrap.categories||[]).find((x)=>String(x.id)===String(btn.dataset.id));if(!c)return;
       if(!window.confirm('Delete '+c.name+'?'))return;
       try{
