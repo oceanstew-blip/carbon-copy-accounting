@@ -253,8 +253,10 @@ app.post("/api/receipts",upload.single("file"),async(req,res,next)=>{try{
   const sha=crypto.createHash("sha256").update(f.buffer).digest("hex");
   const existing=(await pool.query("SELECT id,transaction_id FROM receipts WHERE file_sha256=$1",[sha])).rows[0];
   if(existing)return res.status(200).json({id:existing.id,duplicate:true,transaction_id:existing.transaction_id});
-  const tid=req.body.transaction_id?Number(req.body.transaction_id):null;
+  let tid=req.body.transaction_id?Number(req.body.transaction_id):null;
   const date=req.body.receipt_date||null,vendor=String(req.body.vendor||"").trim()||null,amount=moneyNum(req.body.amount),cat=req.body.category_id?Number(req.body.category_id):null,receiptText=String(req.body.receipt_text||"").trim()||null;
+  const paymentMethod=["credit_card","wire","check","cash"].includes(req.body.payment_method)?req.body.payment_method:"credit_card";
+  const paymentReference=String(req.body.payment_reference||"").trim()||null;
   let inferredCat=Number.isFinite(cat)?cat:null;
   if(!inferredCat){
     const txt=(receiptText||"").toLowerCase();
@@ -267,6 +269,16 @@ app.post("/api/receipts",upload.single("file"),async(req,res,next)=>{try{
     else if(/\b(office|paper|printer|ink|staple|staples|notebook)\b/i.test(txt)) inferredName="Supplies";
     else if(/\b(weather|routing|forecast|buoyweather|weatherbell)\b/i.test(txt)) inferredName="Navigation / Weather";
     if(inferredName) inferredCat=(await pool.query("SELECT id FROM categories WHERE name=$1 LIMIT 1",[inferredName])).rows[0]?.id||null;
+  }
+  if(!Number.isFinite(tid) && paymentMethod!=="credit_card"){
+    if(!date||!vendor||amount===null)return res.status(400).json({error:"Date, vendor, and amount are required for wire, check, or cash expenses"});
+    const rule=(await pool.query("SELECT category_id FROM vendor_rules WHERE $1 ILIKE '%'||vendor_pattern||'%' ORDER BY length(vendor_pattern) DESC LIMIT 1",[vendor])).rows[0];
+    const chosenCategory=inferredCat||rule?.category_id||null;
+    const ext=crypto.createHash("sha256").update([date,paymentMethod,paymentReference||"",vendor.toUpperCase(),amount.toFixed(2)].join("|")).digest("hex");
+    const tr=await pool.query(`INSERT INTO transactions(transaction_date,posted_date,vendor_raw,vendor_normalized,amount,category_id,card_id,notes,source,external_id,status,payment_method,payment_reference,captain_reviewed)
+      VALUES($1,$1,$2,$2,$3,$4,NULL,NULL,'manual',$5,'posted',$6,$7,$8)
+      ON CONFLICT DO NOTHING RETURNING id`,[date,vendor,amount,chosenCategory,ext,paymentMethod,paymentReference,Boolean(chosenCategory)]);
+    tid=tr.rows[0]?.id||((await pool.query("SELECT id FROM transactions WHERE external_id=$1 LIMIT 1",[ext])).rows[0]?.id||null);
   }
   const q=await pool.query(`INSERT INTO receipts(transaction_id,file_name,content_type,file_size,file_data,receipt_date,vendor,amount,category_id,file_sha256,receipt_text,expires_at)
     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW()+INTERVAL '60 days') RETURNING id,file_name,expires_at`,[Number.isFinite(tid)?tid:null,f.originalname,f.mimetype,f.size,f.buffer,date,vendor,amount,inferredCat,sha,receiptText]);
@@ -320,4 +332,5 @@ app.post("/api/close-month",async(req,res,next)=>{try{
 
 app.use((err,_req,res,_next)=>{console.error(err);if(err.code==="LIMIT_FILE_SIZE")return res.status(413).json({error:"Receipt must be under 20MB"});res.status(500).json({error:"Server error"})});
 
+await init();
 app.listen(port,"0.0.0.0",()=>console.log(`Carbon Copy Accounting listening on ${port}`));
