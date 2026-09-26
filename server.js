@@ -3,7 +3,7 @@ import multer from "multer";
 import pg from "pg";
 import crypto from "crypto";
 import sharp from "sharp";
-import { createWorker } from "tesseract.js";
+import { createWorker, PSM } from "tesseract.js";
 import { capitalOneCsv, initialRules, driveReceipts } from "./seed.js";
 
 const {Pool}=pg;
@@ -29,7 +29,17 @@ app.use(express.static("public"));
 let ocrWorkerPromise=null;
 async function getOcrWorker(){
   if(!ocrWorkerPromise){
-    ocrWorkerPromise=createWorker("eng").catch((e)=>{ocrWorkerPromise=null;throw e});
+    ocrWorkerPromise=(async()=>{
+      const worker=await createWorker("eng");
+      await worker.setParameters({
+        tessedit_pageseg_mode:PSM.AUTO,
+        preserve_interword_spaces:"1",
+        user_defined_dpi:"300",
+        load_system_dawg:"0",
+        load_freq_dawg:"0"
+      });
+      return worker;
+    })().catch((e)=>{ocrWorkerPromise=null;throw e});
   }
   return ocrWorkerPromise;
 }
@@ -62,6 +72,11 @@ function suggestedCategoryFromText(text){
   if(/\b(fuel|diesel|gasoline|gas station|racetrac|wawa|lubricant|oil)\b/i.test(t))return "Fuel & Lubricants";
   return null;
 }
+function labeledAmount(lines,re){
+  const matches=lines.filter((line)=>re.test(line));
+  for(let i=matches.length-1;i>=0;i--){const a=amountFromLine(matches[i]);if(a!==null)return a}
+  return null;
+}
 function parseOcrReceipt(text){
   const lines=String(text||"").split(/\r?\n/).map((x)=>x.replace(/\s+/g," ").trim()).filter(Boolean);
   const paymentText=lines.join(" ").toLowerCase();
@@ -71,19 +86,11 @@ function parseOcrReceipt(text){
   else if(/\b(payment|paid)\s*:?\s*wire\b|\bwire\s+(transfer|payment)\b/i.test(paymentText)) detected_payment_method="wire";
   else if(/\b(visa|mastercard|amex|american express|discover|credit card|card ending|card #)\b/i.test(paymentText)) detected_payment_method="credit_card";
 
-  let amount=null;
-  const exactTotal=lines.filter((line)=>
-    /^(?:grand\s+total|total|amount\s+due|balance\s+due)\b/i.test(line) &&
-    !/subtotal|cash tendered|tendered|change|tip|gratuity/i.test(line)
-  );
-  for(let i=exactTotal.length-1;i>=0;i--){const a=amountFromLine(exactTotal[i]);if(a!==null){amount=a;break}}
-  if(amount===null){
-    const containsTotal=lines.filter((line)=>
-      /\b(grand\s+total|amount\s+due|balance\s+due|total)\b/i.test(line) &&
-      !/subtotal|cash tendered|tendered|change|tip|gratuity/i.test(line)
-    );
-    for(let i=containsTotal.length-1;i>=0;i--){const a=amountFromLine(containsTotal[i]);if(a!==null){amount=a;break}}
-  }
+  let amount=labeledAmount(lines,/^(?:grand\s+total|total|amount\s+due|balance\s+due)\b/i);
+  if(amount===null)amount=labeledAmount(lines,/\b(grand\s+total|amount\s+due|balance\s+due|total)\b/i);
+  const subtotal=labeledAmount(lines,/^subtotal\b/i);
+  const tax=labeledAmount(lines,/^(?:sales\s+)?tax\b/i);
+  const total_verified=amount!==null&&subtotal!==null&&tax!==null&&Math.abs((subtotal+tax)-amount)<0.08;
 
   let receipt_date=null;
   for(const line of lines){receipt_date=isoReceiptDate(line);if(receipt_date)break}
@@ -96,20 +103,75 @@ function parseOcrReceipt(text){
   )||null;
 
   return {
-    vendor,receipt_date,amount,
+    vendor,receipt_date,amount,subtotal,tax,total_verified,
     receipt_text:lines.join("\n"),
     suggested_category:suggestedCategoryFromText(text),
     detected_payment_method
   };
 }
-async function ocrImage(buffer){
-  const prepared=await sharp(buffer,{failOn:"none"}).rotate().resize({width:2200,height:2200,fit:"inside",withoutEnlargement:true}).grayscale().normalize().png().toBuffer();
-  const worker=await getOcrWorker();
-  const result=await worker.recognize(prepared);
-  const parsed=parseOcrReceipt(result?.data?.text||"");
-  return {...parsed,confidence:Math.round(Number(result?.data?.confidence)||0)};
+function mergeOcrFields(full,top,bottom,confidence){
+  const merged={
+    vendor:top.vendor||full.vendor||null,
+    receipt_date:full.receipt_date||top.receipt_date||bottom.receipt_date||null,
+    amount:bottom.amount??full.amount??null,
+    subtotal:bottom.subtotal??full.subtotal??null,
+    tax:bottom.tax??full.tax??null,
+    total_verified:Boolean(bottom.total_verified||full.total_verified),
+    receipt_text:full.receipt_text||"",
+    suggested_category:full.suggested_category||bottom.suggested_category||top.suggested_category||null,
+    detected_payment_method:bottom.detected_payment_method||full.detected_payment_method||null,
+    confidence:Math.round(Number(confidence)||0)
+  };
+  const reasons=[];
+  if(!merged.vendor)reasons.push("vendor");
+  if(!merged.receipt_date)reasons.push("date");
+  if(merged.amount===null)reasons.push("total");
+  if(!merged.detected_payment_method)reasons.push("payment method");
+  if(!merged.suggested_category)reasons.push("category");
+  if(merged.amount!==null&&!merged.total_verified&&merged.subtotal!==null&&merged.tax!==null)reasons.push("total arithmetic");
+  let score=0;
+  if(merged.vendor)score++;
+  if(merged.receipt_date)score++;
+  if(merged.amount!==null)score++;
+  if(merged.detected_payment_method)score++;
+  if(merged.suggested_category)score++;
+  merged.field_score=score;
+  merged.review_reasons=reasons;
+  return merged;
 }
+async function ocrImage(buffer){
+  const base=await sharp(buffer,{failOn:"none"})
+    .rotate()
+    .resize({width:2400,height:3200,fit:"inside",withoutEnlargement:true})
+    .grayscale()
+    .normalize()
+    .sharpen()
+    .extend({top:30,bottom:30,left:30,right:30,background:"white"})
+    .png()
+    .toBuffer();
 
+  const meta=await sharp(base).metadata();
+  const width=meta.width,height=meta.height;
+  const topHeight=Math.max(1,Math.round(height*0.34));
+  const bottomTop=Math.max(0,Math.round(height*0.45));
+  const bottomHeight=Math.max(1,height-bottomTop);
+  const topCrop=await sharp(base).extract({left:0,top:0,width,height:topHeight}).png().toBuffer();
+  const bottomCrop=await sharp(base).extract({left:0,top:bottomTop,width,height:bottomHeight}).threshold(180).png().toBuffer();
+
+  const worker=await getOcrWorker();
+  await worker.setParameters({tessedit_pageseg_mode:PSM.AUTO,preserve_interword_spaces:"1"});
+  const fullResult=await worker.recognize(base);
+  await worker.setParameters({tessedit_pageseg_mode:PSM.SINGLE_BLOCK,preserve_interword_spaces:"1"});
+  const topResult=await worker.recognize(topCrop);
+  await worker.setParameters({tessedit_pageseg_mode:PSM.SPARSE_TEXT,preserve_interword_spaces:"1"});
+  const bottomResult=await worker.recognize(bottomCrop);
+  await worker.setParameters({tessedit_pageseg_mode:PSM.AUTO,preserve_interword_spaces:"1"});
+
+  const full=parseOcrReceipt(fullResult?.data?.text||"");
+  const top=parseOcrReceipt(topResult?.data?.text||"");
+  const bottom=parseOcrReceipt(bottomResult?.data?.text||"");
+  return mergeOcrFields(full,top,bottom,fullResult?.data?.confidence);
+}
 function monthBounds(month){
   const m=/^\d{4}-\d{2}$/.test(month||"")?month:new Date().toISOString().slice(0,7);
   const [y,mo]=m.split("-").map(Number);
@@ -149,6 +211,10 @@ async function init(){
     ALTER TABLE receipts ADD COLUMN IF NOT EXISTS purged_at TIMESTAMPTZ;
     ALTER TABLE receipts ADD COLUMN IF NOT EXISTS payment_method TEXT;
     ALTER TABLE receipts ADD COLUMN IF NOT EXISTS payment_reference TEXT;
+    ALTER TABLE receipts ADD COLUMN IF NOT EXISTS review_required BOOLEAN NOT NULL DEFAULT TRUE;
+    ALTER TABLE receipts ADD COLUMN IF NOT EXISTS ocr_confidence INT;
+    ALTER TABLE receipts ADD COLUMN IF NOT EXISTS ocr_field_score INT;
+    ALTER TABLE receipts ADD COLUMN IF NOT EXISTS ocr_review_reasons TEXT;
     ALTER TABLE receipts ALTER COLUMN file_data DROP NOT NULL;
     ALTER TABLE transactions ADD COLUMN IF NOT EXISTS payment_method TEXT NOT NULL DEFAULT 'credit_card';
     ALTER TABLE transactions ADD COLUMN IF NOT EXISTS payment_reference TEXT;
@@ -361,7 +427,9 @@ app.post("/api/vendor-rules",async(req,res,next)=>{try{
 }catch(e){next(e)}});
 
 app.get("/api/receipt-inbox",async(_req,res,next)=>{try{
-  const q=await pool.query(`SELECT r.id,r.receipt_date,r.vendor,r.amount,r.file_name,r.created_at,r.expires_at,r.purged_at,r.receipt_text,r.payment_method,r.payment_reference,c.name category_name,c.id category_id
+  const q=await pool.query(`SELECT r.id,r.receipt_date,r.vendor,r.amount,r.file_name,r.created_at,r.expires_at,r.purged_at,r.receipt_text,r.payment_method,r.payment_reference,
+      r.review_required,r.ocr_confidence,r.ocr_field_score,r.ocr_review_reasons,c.name category_name,c.id category_id,
+      CASE WHEN r.review_required OR r.payment_method IS NULL OR r.payment_method <> 'credit_card' THEN 'review' ELSE 'waiting' END bucket
     FROM receipts r LEFT JOIN categories c ON c.id=r.category_id WHERE r.transaction_id IS NULL ORDER BY COALESCE(r.receipt_date,r.created_at::date) DESC,r.id DESC`);
   res.json({rows:q.rows})
 }catch(e){next(e)}});
@@ -387,7 +455,7 @@ app.post("/api/receipts",upload.single("file"),async(req,res,next)=>{try{
           VALUES($1,$1,$2,$2,$3,$4,NULL,'manual',$5,'posted',$6,$7,$8) ON CONFLICT DO NOTHING RETURNING id`,[useDate,useVendor,useAmount,chosenCategory,ext,paymentMethod,paymentReference,Boolean(chosenCategory)]);
         const newTid=tr.rows[0]?.id||((await pool.query("SELECT id FROM transactions WHERE external_id=$1 LIMIT 1",[ext])).rows[0]?.id||null);
         if(newTid){
-          await pool.query("UPDATE receipts SET transaction_id=$1,receipt_date=COALESCE(receipt_date,$2),vendor=COALESCE(vendor,$3),amount=COALESCE(amount,$4),category_id=COALESCE(category_id,$5),receipt_text=COALESCE(receipt_text,$6) WHERE id=$7",[newTid,useDate,useVendor,useAmount,chosenCategory,receiptText,existing.id]);
+          await pool.query("UPDATE receipts SET transaction_id=$1,receipt_date=COALESCE(receipt_date,$2),vendor=COALESCE(vendor,$3),amount=COALESCE(amount,$4),category_id=COALESCE(category_id,$5),receipt_text=COALESCE(receipt_text,$6),review_required=false WHERE id=$7",[newTid,useDate,useVendor,useAmount,chosenCategory,receiptText,existing.id]);
           return res.status(200).json({id:existing.id,duplicate:true,promoted:true,created_transaction_id:newTid,payment_method:paymentMethod});
         }
       }
@@ -417,8 +485,8 @@ app.post("/api/receipts",upload.single("file"),async(req,res,next)=>{try{
       ON CONFLICT DO NOTHING RETURNING id`,[date,vendor,amount,chosenCategory,ext,paymentMethod,paymentReference,Boolean(chosenCategory)]);
     tid=tr.rows[0]?.id||((await pool.query("SELECT id FROM transactions WHERE external_id=$1 LIMIT 1",[ext])).rows[0]?.id||null);
   }
-  const q=await pool.query(`INSERT INTO receipts(transaction_id,file_name,content_type,file_size,file_data,receipt_date,vendor,amount,category_id,file_sha256,receipt_text,expires_at,payment_method,payment_reference)
-    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW()+INTERVAL '60 days',$12,$13) RETURNING id,file_name,expires_at`,[Number.isFinite(tid)?tid:null,f.originalname,f.mimetype,f.size,f.buffer,date,vendor,amount,inferredCat,sha,receiptText,paymentMethod,paymentReference]);
+  const q=await pool.query(`INSERT INTO receipts(transaction_id,file_name,content_type,file_size,file_data,receipt_date,vendor,amount,category_id,file_sha256,receipt_text,expires_at,payment_method,payment_reference,review_required)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW()+INTERVAL '60 days',$12,$13,false) RETURNING id,file_name,expires_at`,[Number.isFinite(tid)?tid:null,f.originalname,f.mimetype,f.size,f.buffer,date,vendor,amount,inferredCat,sha,receiptText,paymentMethod,paymentReference]);
   const matched=paymentMethod==="credit_card"?await autoMatchReceipt(q.rows[0].id):null;
   res.status(201).json({...q.rows[0],matched_transaction_id:matched,created_transaction_id:Number.isFinite(tid)?tid:null,payment_method:paymentMethod})
 }catch(e){next(e)}});
@@ -438,7 +506,7 @@ app.patch("/api/receipts/:id",async(req,res,next)=>{try{
   const paymentReference=b.payment_reference===undefined?current.payment_reference:String(b.payment_reference||"").trim()||null;
   if(!paymentMethod)return res.status(400).json({error:"Confirm the payment method before saving"});
 
-  await pool.query(`UPDATE receipts SET receipt_date=$1,vendor=$2,amount=$3,category_id=$4,receipt_text=$5,payment_method=$6,payment_reference=$7 WHERE id=$8`,
+  await pool.query(`UPDATE receipts SET receipt_date=$1,vendor=$2,amount=$3,category_id=$4,receipt_text=$5,payment_method=$6,payment_reference=$7,review_required=false WHERE id=$8`,
     [date,vendor,amount,categoryId,receiptText,paymentMethod,paymentReference,id]);
 
   let createdTransactionId=null,matched=null;
