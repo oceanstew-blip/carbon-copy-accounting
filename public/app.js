@@ -28,6 +28,7 @@ function showView(name){
   $$('.view').forEach((v)=>v.classList.toggle('active',v.id===name));
   if(name==='transactions') loadTransactions().catch(console.error);
   if(name==='receipts') loadReceiptInbox().catch(console.error);
+  if(name==='system') runSystemCheck().catch(console.error);
 }
 
 function wireNavigation(){
@@ -179,10 +180,109 @@ function parseCSV(text){
   }).filter((r)=>r.transaction_date&&r.vendor_raw&&Number.isFinite(r.amount));
 }
 
+
+async function runSystemCheck(){
+  const summary=$('#systemCheckSummary'),box=$('#systemCheckResults'),details=$('#systemCheckDetails');
+  if(!summary||!box) return;
+  summary.textContent='Running read-only checks…';
+  box.innerHTML='';
+  if(details) details.innerHTML='';
+
+  const results=[];
+  const add=(name,ok,detail)=>{results.push({name,ok,detail});};
+  const test=async(name,fn)=>{
+    try{const detail=await fn();add(name,true,detail||'OK');}
+    catch(e){add(name,false,(e&&e.message)||String(e));}
+  };
+
+  const expectedViews=['dashboard','transactions','receipts','import','reports','rules','system'];
+  await test('Navigation structure',async()=>{
+    const missing=expectedViews.filter((id)=>!document.getElementById(id)||!document.querySelector('.nav[data-view="'+id+'"]'));
+    if(missing.length) throw new Error('Missing: '+missing.join(', '));
+    return expectedViews.length+' tabs/views present';
+  });
+
+  await test('Navigation clicks',async()=>{
+    const original='system';
+    for(const id of expectedViews){
+      const btn=document.querySelector('.nav[data-view="'+id+'"]');
+      btn.click();
+      await new Promise((resolve)=>setTimeout(resolve,0));
+      const view=document.getElementById(id);
+      if(!btn.classList.contains('active')||!view.classList.contains('active')) throw new Error(id+' did not activate');
+    }
+    showView(original);
+    return 'All tabs activate';
+  });
+
+  await test('Bootstrap API',async()=>{
+    const d=await api('bootstrap');
+    if(!Array.isArray(d.categories)||!Array.isArray(d.cards)||!Array.isArray(d.payment_methods)) throw new Error('Unexpected response shape');
+    if(!d.payment_methods.includes('cash')||!d.payment_methods.includes('wire')||!d.payment_methods.includes('check')||!d.payment_methods.includes('credit_card')) throw new Error('Payment methods incomplete');
+    return d.categories.length+' categories · '+d.cards.length+' card(s)';
+  });
+
+  let txRows=[];
+  await test('Dashboard API',async()=>{
+    const d=await api('dashboard?month='+encodeURIComponent(currentMonth()));
+    if(!d.summary) throw new Error('Missing summary');
+    return String(d.summary.transactions||0)+' transactions · '+money(d.summary.total_spend);
+  });
+
+  await test('Transactions API',async()=>{
+    const d=await api('transactions?month='+encodeURIComponent(currentMonth()));
+    if(!Array.isArray(d.rows)) throw new Error('Rows missing');
+    txRows=d.rows;
+    return d.rows.length+' rows loaded';
+  });
+
+  await test('Receipt Inbox API',async()=>{
+    const d=await api('receipt-inbox');
+    if(!Array.isArray(d.rows)) throw new Error('Rows missing');
+    return d.rows.length+' waiting receipt(s)';
+  });
+
+  await test('Reports API',async()=>{
+    const m=currentMonth().split('-');
+    const d=await api('report?scope=month&year='+encodeURIComponent(m[0])+'&month='+encodeURIComponent(Number(m[1])));
+    if(!d.summary) throw new Error('Missing report summary');
+    return String(d.summary.transaction_count||0)+' transactions · '+money(d.summary.total);
+  });
+
+  await test('Cash workflow visibility',async()=>{
+    const cash=txRows.filter((t)=>t.payment_method==='cash');
+    if(!cash.length) return 'No cash transactions in '+currentMonth()+' yet';
+    const linked=cash.filter((t)=>t.receipt_id).length;
+    return cash.length+' cash transaction(s) · '+linked+' with linked receipt(s)';
+  });
+
+  await test('Receipt file endpoint',async()=>{
+    const t=txRows.find((x)=>x.receipt_id);
+    if(!t) return 'No linked receipt available to probe';
+    const r=await fetch('/api/receipts/'+t.receipt_id,{method:'HEAD',redirect:'manual'});
+    if(!(r.ok||r.type==='opaqueredirect'||(r.status>=300&&r.status<400))) throw new Error('HTTP '+r.status);
+    return (t.file_name||('Receipt #'+t.receipt_id))+' reachable';
+  });
+
+  const passed=results.filter((r)=>r.ok).length;
+  const failed=results.length-passed;
+  summary.className=failed?'system-summary warn':'system-summary ok';
+  summary.textContent=failed?passed+' passed · '+failed+' failed':passed+' of '+results.length+' checks passed';
+  box.innerHTML=results.map((r)=>'<div class="check-item '+(r.ok?'pass':'fail')+'"><div><b>'+(r.ok?'PASS':'FAIL')+'</b> '+esc(r.name)+'</div><span>'+esc(r.detail)+'</span></div>').join('');
+
+  if(details&&txRows.length){
+    const cash=txRows.filter((t)=>t.payment_method==='cash');
+    details.innerHTML='<h3>Current-month cash transactions</h3>'+(cash.length
+      ? '<div class="table-wrap"><table><thead><tr><th>Date</th><th>Vendor</th><th>Amount</th><th>Receipt</th></tr></thead><tbody>'+cash.map((t)=>'<tr><td>'+esc(String(t.transaction_date||'').slice(0,10))+'</td><td>'+esc(t.vendor_normalized||t.vendor_raw||'')+'</td><td>'+money(t.amount)+'</td><td>'+(t.receipt_id?'<a class="receipt-link" target="_blank" href="/api/receipts/'+t.receipt_id+'">'+esc(t.file_name||'Receipt')+'</a>':'Missing')+'</td></tr>').join('')+'</tbody></table></div>'
+      : '<p class="muted">No cash transactions found for '+esc(currentMonth())+'.</p>');
+  }
+}
+
 function wireStaticControls(){
   const monthEl=$('#month');
   if(monthEl){monthEl.value=new Date().toISOString().slice(0,7);monthEl.addEventListener('change',()=>Promise.all([loadDashboard(),loadTransactions()]));}
   if($('#refresh')) $('#refresh').addEventListener('click',()=>Promise.all([loadDashboard(),loadTransactions(),loadReceiptInbox()]));
+  if($('#runSystemCheck')) $('#runSystemCheck').addEventListener('click',()=>runSystemCheck().catch((e)=>{console.error(e);toast('System check failed to run');}));
   if($('#txFilter')) $('#txFilter').addEventListener('change',renderTransactions);
   if($('#sortBy')) $('#sortBy').addEventListener('change',renderTransactions);
   if($('#sortDir')) $('#sortDir').addEventListener('change',renderTransactions);
