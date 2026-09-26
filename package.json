@@ -1,0 +1,10 @@
+{
+  "name": "carbon-copy-accounting",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@netlify/blobs": "latest",
+    "@netlify/database": "latest",
+    "@netlify/functions": "latest"
+  }
+}
