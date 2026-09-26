@@ -148,8 +148,10 @@ async function loadReceiptInbox(){
       '<div class="muted">'+esc(String(r.receipt_date||'No date').slice(0,10))+' · '+(r.amount==null?'No amount':money(r.amount))+
       ' · '+esc(paymentNames[r.payment_method]||'Payment not confirmed')+'</div>'+
       quality+
-      '<div><span class="badge">'+esc(r.category_name||'Uncategorized')+'</span> · <a target="_blank" href="/api/receipts/'+r.id+'">Open full-size receipt</a></div>'+
-      (showFix?'<div class="row"><button class="edit-receipt" data-id="'+r.id+'">Review / Fix</button></div>':'<div class="row"><button class="edit-receipt" data-id="'+r.id+'">Review / Fix</button></div>')+
+      '<div><span class="badge">'+esc(r.category_name||'Uncategorized')+'</span></div>'+
+      '<button class="receipt-thumb" data-id="'+r.id+'" type="button"><img src="/api/receipts/'+r.id+'" alt="Receipt '+r.id+' preview"></button>'+
+      '<div class="row"><button class="show-receipt" data-id="'+r.id+'" type="button">View Here</button></div>'+
+      '<div class="row"><button class="edit-receipt" data-id="'+r.id+'" type="button">Review / Fix</button></div>'+
       '</div>';
   };
 
@@ -158,7 +160,16 @@ async function loadReceiptInbox(){
   waiting.innerHTML=waitingRows.length?waitingRows.map((r)=>renderItem(r,false)).join(''):'<p class="muted">No credit-card receipts waiting to match.</p>';
   review.innerHTML=reviewRows.length?reviewRows.map((r)=>renderItem(r,true)).join(''):'<p class="muted">Nothing needs review.</p>';
 
-  $$('.edit-receipt').forEach((btn)=>btn.addEventListener('click',()=>{
+  const showReceiptInline=(id)=>{
+    renderExistingReceiptPreview(id);
+    const box=$('#receiptPreview');
+    if(box)box.scrollIntoView({behavior:'smooth',block:'center'});
+  };
+  $('.show-receipt,.receipt-thumb').forEach((btn)=>btn.addEventListener('click',()=>{
+    showReceiptInline(btn.dataset.id);
+  }));
+
+  $('.edit-receipt').forEach((btn)=>btn.addEventListener('click',()=>{
     const r=receiptInbox.find((x)=>String(x.id)===String(btn.dataset.id));
     if(!r)return;
     editingReceiptId=r.id;
@@ -175,7 +186,8 @@ async function loadReceiptInbox(){
     $('#reviewPrompt').textContent='Editing receipt #'+r.id+'. Your corrections will replace the extracted values.';
     $('#uploadReceipt').textContent='Save Corrections';
     renderExistingReceiptPreview(r.id);
-    window.scrollTo({top:document.getElementById('receipts').offsetTop,behavior:'smooth'});
+    const preview=$('#receiptPreview');
+    if(preview)preview.scrollIntoView({behavior:'smooth',block:'center'});
   }));
 }
 function renderRules(){
