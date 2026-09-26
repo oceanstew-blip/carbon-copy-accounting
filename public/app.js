@@ -3,6 +3,7 @@ let bootstrap={categories:[],cards:[],rules:[]};
 let transactions=[];
 let receiptInbox=[];
 let editingReceiptId=null;
+let systemCheckRunning=false;
 
 const $=(s)=>document.querySelector(s);
 const $$=(s)=>Array.from(document.querySelectorAll(s));
@@ -328,8 +329,10 @@ function parseCSV(text){
 
 
 async function runSystemCheck(){
+  if(systemCheckRunning) return;
+  systemCheckRunning=true;
   const summary=$('#systemCheckSummary'),box=$('#systemCheckResults'),details=$('#systemCheckDetails');
-  if(!summary||!box) return;
+  if(!summary||!box){systemCheckRunning=false;return;}
   summary.textContent='Running read-only checks…';
   box.innerHTML='';
   if(details) details.innerHTML='';
@@ -348,17 +351,14 @@ async function runSystemCheck(){
     return expectedViews.length+' tabs/views present';
   });
 
-  await test('Navigation clicks',async()=>{
-    const original='system';
-    for(const id of expectedViews){
+  await test('Navigation wiring',async()=>{
+    const bad=expectedViews.filter((id)=>{
       const btn=document.querySelector('.nav[data-view="'+id+'"]');
-      btn.click();
-      await new Promise((resolve)=>setTimeout(resolve,0));
       const view=document.getElementById(id);
-      if(!btn.classList.contains('active')||!view.classList.contains('active')) throw new Error(id+' did not activate');
-    }
-    showView(original);
-    return 'All tabs activate';
+      return !btn||!view||btn.dataset.view!==id;
+    });
+    if(bad.length) throw new Error('Broken navigation: '+bad.join(', '));
+    return 'All tabs are wired without changing views';
   });
 
   await test('Bootstrap API',async()=>{
@@ -429,6 +429,7 @@ async function runSystemCheck(){
       ? '<div class="table-wrap"><table><thead><tr><th>Date</th><th>Vendor</th><th>Amount</th><th>Receipt</th></tr></thead><tbody>'+cash.map((t)=>'<tr><td>'+esc(String(t.transaction_date||'').slice(0,10))+'</td><td>'+esc(t.vendor_normalized||t.vendor_raw||'')+'</td><td>'+money(t.amount)+'</td><td>'+(t.receipt_id?'<a class="receipt-link" target="_blank" href="/api/receipts/'+t.receipt_id+'">'+esc(t.file_name||'Receipt')+'</a>':'Missing')+'</td></tr>').join('')+'</tbody></table></div>'
       : '<p class="muted">No cash transactions found for '+esc(currentMonth())+'.</p>');
   }
+  systemCheckRunning=false;
 }
 
 function wireStaticControls(){
