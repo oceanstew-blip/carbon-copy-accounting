@@ -480,10 +480,13 @@ function wireStaticControls(){
     else if(actualPayment==='credit_card') msg='Saved as CREDIT CARD. Waiting to Match with Capital One.';
     else msg='Saved. Review this receipt in Needs Review / Fix.';
     $('#receiptUploadStatus').innerHTML='<p class="ok">'+esc(msg)+'</p>';
+    const savedDate=$('#rDate').value;
     $('#rFile').value='';
     resetReceiptReview();
     $('#receiptUploadStatus').innerHTML='<p class="ok">'+esc(msg)+'</p>';
+    if(nonCard&&savedDate&&$('#month')) $('#month').value=savedDate.slice(0,7);
     await Promise.all([loadReceiptInbox(),loadTransactions(),loadDashboard()]);
+    if(nonCard) showView('transactions');
   });
 
   if($('#addCategory')) $('#addCategory').addEventListener('click',async()=>{
