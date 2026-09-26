@@ -53,6 +53,7 @@ async function init(){
     ALTER TABLE receipts ADD COLUMN IF NOT EXISTS amount NUMERIC(12,2);
     ALTER TABLE receipts ADD COLUMN IF NOT EXISTS category_id BIGINT REFERENCES categories(id) ON DELETE SET NULL;
     ALTER TABLE receipts ADD COLUMN IF NOT EXISTS file_sha256 TEXT;
+    ALTER TABLE receipts ADD COLUMN IF NOT EXISTS source_url TEXT;
     CREATE UNIQUE INDEX IF NOT EXISTS receipts_sha_idx ON receipts(file_sha256) WHERE file_sha256 IS NOT NULL;
     CREATE TABLE IF NOT EXISTS vendor_rules(
       id BIGSERIAL PRIMARY KEY,vendor_pattern TEXT NOT NULL UNIQUE,category_id BIGINT NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
@@ -203,7 +204,8 @@ app.patch("/api/receipts/:id",async(req,res,next)=>{try{
 }catch(e){next(e)}});
 
 app.get("/api/receipts/:id",async(req,res,next)=>{try{
-  const q=await pool.query("SELECT file_name,content_type,file_data FROM receipts WHERE id=$1",[Number(req.params.id)]);const r=q.rows[0];if(!r)return res.sendStatus(404);
+  const q=await pool.query("SELECT file_name,content_type,file_data,source_url FROM receipts WHERE id=$1",[Number(req.params.id)]);const r=q.rows[0];if(!r)return res.sendStatus(404);
+  if(r.source_url)return res.redirect(r.source_url);
   res.type(r.content_type);res.set("Content-Disposition",`inline; filename="${String(r.file_name).replaceAll('"','')}"`);res.send(r.file_data)
 }catch(e){next(e)}});
 
