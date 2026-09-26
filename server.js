@@ -157,10 +157,10 @@ app.get("/api/bootstrap",async(_req,res,next)=>{try{
 app.get("/api/dashboard",async(req,res,next)=>{try{
   const {month,start,next:n}=monthBounds(req.query.month);
   const [s,bc,bv,ri]=await Promise.all([
-    pool.query(`SELECT COUNT(*)::int transactions,COALESCE(SUM(amount),0)::numeric total_spend,
-      COUNT(*) FILTER(WHERE category_id IS NULL)::int needs_category,
+    pool.query(`SELECT COUNT(*)::int transactions,COALESCE(SUM(t.amount),0)::numeric total_spend,
+      COUNT(*) FILTER(WHERE t.category_id IS NULL)::int needs_category,
       COUNT(*) FILTER(WHERE r.id IS NULL)::int missing_receipts,
-      COUNT(*) FILTER(WHERE captain_reviewed=false)::int needs_review
+      COUNT(*) FILTER(WHERE t.captain_reviewed=false)::int needs_review
       FROM transactions t LEFT JOIN receipts r ON r.transaction_id=t.id
       WHERE t.status='posted' AND t.transaction_date >= $1::date AND t.transaction_date < $2::date`,[start,n]),
     pool.query(`SELECT COALESCE(c.name,'Uncategorized') name,COALESCE(SUM(t.amount),0)::numeric total
@@ -283,7 +283,7 @@ app.post("/api/receipts",upload.single("file"),async(req,res,next)=>{try{
   const q=await pool.query(`INSERT INTO receipts(transaction_id,file_name,content_type,file_size,file_data,receipt_date,vendor,amount,category_id,file_sha256,receipt_text,expires_at)
     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW()+INTERVAL '60 days') RETURNING id,file_name,expires_at`,[Number.isFinite(tid)?tid:null,f.originalname,f.mimetype,f.size,f.buffer,date,vendor,amount,inferredCat,sha,receiptText]);
   const matched=await autoMatchReceipt(q.rows[0].id);
-  res.status(201).json({...q.rows[0],matched_transaction_id:matched})
+  res.status(201).json({...q.rows[0],matched_transaction_id:matched,created_transaction_id:Number.isFinite(tid)?tid:null,payment_method:paymentMethod})
 }catch(e){next(e)}});
 
 app.patch("/api/receipts/:id",async(req,res,next)=>{try{
@@ -319,9 +319,9 @@ app.get("/api/report",async(req,res,next)=>{try{
 
 app.post("/api/close-month",async(req,res,next)=>{try{
   const {month,start,next:n}=monthBounds(req.body.month);
-  const q=await pool.query(`SELECT COUNT(*) FILTER(WHERE category_id IS NULL)::int uncategorized,
-    COUNT(*) FILTER(WHERE r.id IS NULL)::int missing_receipts,COUNT(*) FILTER(WHERE captain_reviewed=false)::int unreviewed,
-    COALESCE(SUM(amount),0)::numeric total FROM transactions t LEFT JOIN receipts r ON r.transaction_id=t.id
+  const q=await pool.query(`SELECT COUNT(*) FILTER(WHERE t.category_id IS NULL)::int uncategorized,
+    COUNT(*) FILTER(WHERE r.id IS NULL)::int missing_receipts,COUNT(*) FILTER(WHERE t.captain_reviewed=false)::int unreviewed,
+    COALESCE(SUM(t.amount),0)::numeric total FROM transactions t LEFT JOIN receipts r ON r.transaction_id=t.id
     WHERE t.status='posted' AND t.transaction_date >= $1::date AND t.transaction_date < $2::date`,[start,n]);
   const c=q.rows[0],u=(await pool.query("SELECT COUNT(*)::int count FROM receipts WHERE transaction_id IS NULL AND receipt_date >= $1::date AND receipt_date < $2::date",[start,n])).rows[0].count;
   if(c.uncategorized||c.missing_receipts||c.unreviewed||u)return res.status(409).json({closed:false,blockers:{...c,unmatched_receipts:u}});
