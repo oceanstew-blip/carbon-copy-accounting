@@ -169,7 +169,7 @@ async function loadReceiptInbox(){
     showReceiptInline(btn.dataset.id);
   }));
 
-  $('.edit-receipt').forEach((btn)=>btn.addEventListener('click',()=>{
+  $$('.edit-receipt').forEach((btn)=>btn.addEventListener('click',async()=>{
     const r=receiptInbox.find((x)=>String(x.id)===String(btn.dataset.id));
     if(!r)return;
     resetReceiptReview();
@@ -189,6 +189,33 @@ async function loadReceiptInbox(){
     renderExistingReceiptPreview(r.id);
     const preview=$('#receiptPreview');
     if(preview)preview.scrollIntoView({behavior:'smooth',block:'center'});
+
+    // Use this receipt's saved values first, then re-read its image and fill only blanks.
+    try{
+      const fresh=await api('receipts/'+r.id+'/ocr',{method:'POST'});
+      if(!$('#rDate').value&&fresh.receipt_date) $('#rDate').value=fresh.receipt_date;
+      if(!$('#rVendor').value.trim()&&fresh.vendor) $('#rVendor').value=fresh.vendor;
+      if(!$('#rAmount').value&&fresh.amount!=null) $('#rAmount').value=Number(fresh.amount).toFixed(2);
+      if(!$('#rPayment').value&&fresh.detected_payment_method) $('#rPayment').value=fresh.detected_payment_method;
+      if(!$('#rText').value&&fresh.receipt_text) $('#rText').value=fresh.receipt_text;
+      if(!$('#rCategory').value&&fresh.suggested_category){
+        const cat=(bootstrap.categories||[]).find((c)=>c.name===fresh.suggested_category);
+        if(cat) $('#rCategory').value=String(cat.id);
+      }
+      const stillMissing=[];
+      if(!$('#rDate').value) stillMissing.push('date');
+      if(!$('#rVendor').value.trim()) stillMissing.push('vendor');
+      if(!$('#rAmount').value) stillMissing.push('amount');
+      if(!$('#rPayment').value) stillMissing.push('payment method');
+      $('#ocrStatus').className=stillMissing.length?'warn':'ok';
+      $('#ocrStatus').textContent=stillMissing.length
+        ? 'Loaded saved values and re-read this receipt. Still check: '+stillMissing.join(', ')+'.'
+        : 'Loaded saved values and re-read this receipt. Review the fields, then save.';
+    }catch(e){
+      console.info('Receipt re-read unavailable',e);
+      $('#ocrStatus').className='warn';
+      $('#ocrStatus').textContent='Loaded the values already saved for this receipt. Automatic re-reading was not available for this file, so review the fields and fill any blanks.';
+    }
   }));
 }
 function renderRules(){
