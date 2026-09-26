@@ -165,11 +165,11 @@ async function loadReceiptInbox(){
     const box=$('#receiptPreview');
     if(box)box.scrollIntoView({behavior:'smooth',block:'center'});
   };
-  $('.show-receipt,.receipt-thumb').forEach((btn)=>btn.addEventListener('click',()=>{
+  $$('.show-receipt,.receipt-thumb').forEach((btn)=>btn.addEventListener('click',()=>{
     showReceiptInline(btn.dataset.id);
   }));
 
-  $('.edit-receipt').forEach((btn)=>btn.addEventListener('click',()=>{
+  $$('.edit-receipt').forEach((btn)=>btn.addEventListener('click',()=>{
     const r=receiptInbox.find((x)=>String(x.id)===String(btn.dataset.id));
     if(!r)return;
     editingReceiptId=r.id;
