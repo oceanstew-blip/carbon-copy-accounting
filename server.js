@@ -197,10 +197,16 @@ app.patch("/api/transactions/:id",async(req,res,next)=>{try{
   const id=Number(req.params.id);if(!Number.isFinite(id))return res.status(400).json({error:"Invalid transaction id"});
   const c=(await pool.query("SELECT * FROM transactions WHERE id=$1",[id])).rows[0];if(!c)return res.status(404).json({error:"Not found"});
   const b=req.body;
+  const newCategory=b.category_id===undefined?c.category_id:b.category_id;
+  const reviewed=b.category_id!==undefined&&b.category_id!==null?true:(b.captain_reviewed===undefined?c.captain_reviewed:b.captain_reviewed);
+  const vendorName=b.vendor_normalized===undefined?(c.vendor_normalized||c.vendor_raw):b.vendor_normalized;
   await pool.query("UPDATE transactions SET category_id=$1,notes=$2,captain_reviewed=$3,vendor_normalized=$4,updated_at=NOW() WHERE id=$5",[
-    b.category_id===undefined?c.category_id:b.category_id,b.notes===undefined?c.notes:b.notes,
-    b.captain_reviewed===undefined?c.captain_reviewed:b.captain_reviewed,b.vendor_normalized===undefined?c.vendor_normalized:b.vendor_normalized,id]);
-  res.json({ok:true})
+    newCategory,b.notes===undefined?c.notes:b.notes,reviewed,vendorName,id]);
+  if(b.category_id!==undefined&&b.category_id!==null){
+    await pool.query(`INSERT INTO vendor_rules(vendor_pattern,category_id) VALUES($1,$2)
+      ON CONFLICT(vendor_pattern) DO UPDATE SET category_id=EXCLUDED.category_id,approved=true`,[vendorName,Number(b.category_id)]);
+  }
+  res.json({ok:true,learned_vendor_rule:b.category_id!==undefined&&b.category_id!==null})
 }catch(e){next(e)}});
 
 app.post("/api/categories",async(req,res,next)=>{try{
@@ -266,17 +272,4 @@ app.post("/api/close-month",async(req,res,next)=>{try{
 
 app.use((err,_req,res,_next)=>{console.error(err);if(err.code==="LIMIT_FILE_SIZE")return res.status(413).json({error:"Receipt must be under 20MB"});res.status(500).json({error:"Server error"})});
 
-async function startupAudit(){
-  const q=await pool.query(`SELECT COUNT(*)::int total,
-    COUNT(*) FILTER(WHERE transaction_date>='2026-09-01' AND transaction_date<'2026-10-01')::int sep_count,
-    COALESCE(SUM(amount) FILTER(WHERE transaction_date>='2026-09-01' AND transaction_date<'2026-10-01'),0)::numeric sep_sum,
-    COUNT(*) FILTER(WHERE transaction_date>='2026-09-01' AND transaction_date<'2026-10-01' AND category_id IS NULL)::int sep_uncategorized
-    FROM transactions`);
-  const receipts=await pool.query(`SELECT COUNT(*)::int total,COUNT(*) FILTER(WHERE transaction_id IS NULL)::int unmatched FROM receipts`);
-  const unc=await pool.query(`SELECT transaction_date,vendor_raw,amount FROM transactions WHERE transaction_date>='2026-09-01' AND transaction_date<'2026-10-01' AND category_id IS NULL ORDER BY transaction_date, vendor_raw`);
-  const unmatched=await pool.query(`SELECT receipt_date,vendor,amount FROM receipts WHERE transaction_id IS NULL ORDER BY receipt_date,vendor`);
-  console.log("CC_AUDIT",JSON.stringify({summary:q.rows[0],receipts:receipts.rows[0],uncategorized:unc.rows,unmatched_receipts:unmatched.rows}));
-}
-await init();
-await startupAudit();
 app.listen(port,"0.0.0.0",()=>console.log(`Carbon Copy Accounting listening on ${port}`));
