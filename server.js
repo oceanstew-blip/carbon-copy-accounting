@@ -65,9 +65,14 @@ function safeFilePart(value){
 function receiptFileName(vendor,date,amount,mime,original){
   const ext=mime==="application/pdf"?".pdf":mime==="image/png"?".png":mime==="image/webp"?".webp":mime==="image/heic"?".heic":mime==="image/heif"?".heif":".jpg";
   const vendorPart=safeFilePart(vendor);
-  const datePart=date?String(date).slice(0,10):"undated";
-  const amountPart=amount!==null&&amount!==undefined&&Number.isFinite(Number(amount))?" $"+Number(amount).toFixed(2):"";
-  return safeFilePart(datePart+" "+vendorPart+amountPart)+ext;
+  let datePart="undated";
+  if(date){
+    const d=date instanceof Date?date:new Date(date);
+    if(!Number.isNaN(d.getTime())) datePart=d.toISOString().slice(0,10);
+    else datePart=String(date).slice(0,10);
+  }
+  const amountPart=amount!==null&&amount!==undefined&&Number.isFinite(Number(amount))?" - $"+Number(amount).toFixed(2):"";
+  return safeFilePart(vendorPart+" - "+datePart+amountPart)+ext;
 }
 function detectPaymentMethodFromText(text){
   const t=String(text||"").toLowerCase();
@@ -528,7 +533,33 @@ app.post("/api/vendor-rules",async(req,res,next)=>{try{
   res.status(201).json(q.rows[0])
 }catch(e){next(e)}});
 
+async function repairOrphanNonCardReceipts(){
+  const rows=(await pool.query(`SELECT * FROM receipts
+    WHERE transaction_id IS NULL
+      AND payment_method IN ('cash','check','wire')
+      AND receipt_date IS NOT NULL
+      AND vendor IS NOT NULL
+      AND amount IS NOT NULL
+    ORDER BY id`)).rows;
+  let repaired=0;
+  for(const r of rows){
+    const ext=crypto.createHash("sha256").update(["receipt-auto-repair",r.id,String(r.receipt_date).slice(0,10),r.payment_method,String(r.vendor).toUpperCase(),Number(r.amount).toFixed(2)].join("|")).digest("hex");
+    const tr=await pool.query(`INSERT INTO transactions(transaction_date,posted_date,vendor_raw,vendor_normalized,amount,category_id,card_id,source,external_id,status,payment_method,payment_reference,captain_reviewed)
+      VALUES($1,$1,$2,$2,$3,$4,NULL,'receipt-auto-repair',$5,'posted',$6,$7,$8)
+      ON CONFLICT(external_id) WHERE external_id IS NOT NULL DO NOTHING RETURNING id`,[
+        r.receipt_date,r.vendor,Number(r.amount),r.category_id||null,ext,r.payment_method,r.payment_reference||null,Boolean(r.category_id)
+      ]);
+    const tid=tr.rows[0]?.id||((await pool.query("SELECT id FROM transactions WHERE external_id=$1 LIMIT 1",[ext])).rows[0]?.id||null);
+    if(tid){
+      await pool.query("UPDATE receipts SET transaction_id=$1,review_required=false WHERE id=$2",[tid,r.id]);
+      repaired++;
+    }
+  }
+  return repaired;
+}
+
 app.get("/api/receipt-inbox",async(_req,res,next)=>{try{
+  await repairOrphanNonCardReceipts();
   const q=await pool.query(`SELECT r.id,r.receipt_date,r.vendor,r.amount,r.file_name,r.created_at,r.expires_at,r.purged_at,r.receipt_text,r.payment_method,r.payment_reference,
       r.review_required,r.ocr_confidence,r.ocr_field_score,r.ocr_review_reasons,c.name category_name,c.id category_id,
       CASE WHEN r.payment_method = 'credit_card' THEN 'waiting' ELSE 'review' END bucket
@@ -694,6 +725,12 @@ try{
     await pool.query("UPDATE receipts SET file_name=$1 WHERE id=$2",[renamed,r.id]);
   }
   console.log("LEGACY_RECEIPT_NORMALIZE complete");
+  const refreshRows=(await pool.query(`SELECT id,vendor,receipt_date,amount,content_type,file_name FROM receipts WHERE vendor IS NOT NULL`)).rows;
+  for(const r of refreshRows){
+    const renamed=receiptFileName(r.vendor,r.receipt_date,r.amount,r.content_type,r.file_name);
+    if(renamed!==r.file_name) await pool.query("UPDATE receipts SET file_name=$1 WHERE id=$2",[renamed,r.id]);
+  }
+  console.log("LEGACY_FILENAME_REFRESH complete");
 }catch(e){console.error("LEGACY_RECEIPT_NORMALIZE failed",e)}
 
 
