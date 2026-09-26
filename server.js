@@ -259,5 +259,17 @@ app.post("/api/close-month",async(req,res,next)=>{try{
 
 app.use((err,_req,res,_next)=>{console.error(err);if(err.code==="LIMIT_FILE_SIZE")return res.status(413).json({error:"Receipt must be under 20MB"});res.status(500).json({error:"Server error"})});
 
+async function startupAudit(){
+  const q=await pool.query(`SELECT COUNT(*)::int total,
+    COUNT(*) FILTER(WHERE transaction_date>='2026-09-01' AND transaction_date<'2026-10-01')::int sep_count,
+    COALESCE(SUM(amount) FILTER(WHERE transaction_date>='2026-09-01' AND transaction_date<'2026-10-01'),0)::numeric sep_sum,
+    COUNT(*) FILTER(WHERE transaction_date>='2026-09-01' AND transaction_date<'2026-10-01' AND category_id IS NULL)::int sep_uncategorized
+    FROM transactions`);
+  const receipts=await pool.query(`SELECT COUNT(*)::int total,COUNT(*) FILTER(WHERE transaction_id IS NULL)::int unmatched FROM receipts`);
+  const unc=await pool.query(`SELECT transaction_date,vendor_raw,amount FROM transactions WHERE transaction_date>='2026-09-01' AND transaction_date<'2026-10-01' AND category_id IS NULL ORDER BY transaction_date, vendor_raw`);
+  const unmatched=await pool.query(`SELECT receipt_date,vendor,amount FROM receipts WHERE transaction_id IS NULL ORDER BY receipt_date,vendor`);
+  console.log("CC_AUDIT",JSON.stringify({summary:q.rows[0],receipts:receipts.rows[0],uncategorized:unc.rows,unmatched_receipts:unmatched.rows}));
+}
 await init();
+await startupAudit();
 app.listen(port,"0.0.0.0",()=>console.log(`Carbon Copy Accounting listening on ${port}`));
