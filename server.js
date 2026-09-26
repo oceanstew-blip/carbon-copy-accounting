@@ -59,6 +59,16 @@ function amountFromLine(line){
     .map((m)=>Number(m[1].replace(/,/g,""))).filter(Number.isFinite);
   return vals.length?vals[vals.length-1]:null;
 }
+function safeFilePart(value){
+  return String(value||"Receipt").replace(/[^a-z0-9 .&_-]+/gi,"").replace(/\s+/g," ").trim().slice(0,80)||"Receipt";
+}
+function receiptFileName(vendor,date,amount,mime,original){
+  const ext=mime==="application/pdf"?".pdf":mime==="image/png"?".png":mime==="image/webp"?".webp":mime==="image/heic"?".heic":mime==="image/heif"?".heif":".jpg";
+  const vendorPart=safeFilePart(vendor);
+  const datePart=date?String(date).slice(0,10):"undated";
+  const amountPart=amount!==null&&amount!==undefined&&Number.isFinite(Number(amount))?" $"+Number(amount).toFixed(2):"";
+  return safeFilePart(datePart+" "+vendorPart+amountPart)+ext;
+}
 function detectPaymentMethodFromText(text){
   const t=String(text||"").toLowerCase();
   if(/\b(payment|tender(?:ed)?|paid)\s*:?\s*cash\b|\bcash\s+(tendered|payment)\b/i.test(t))return "cash";
@@ -535,6 +545,7 @@ app.post("/api/receipts",upload.any(),async(req,res,next)=>{try{
   const sha=crypto.createHash("sha256").update(f.buffer).digest("hex");
   let tid=req.body.transaction_id?Number(req.body.transaction_id):null;
   const date=req.body.receipt_date||null,vendor=String(req.body.vendor||"").trim()||null,amount=moneyNum(req.body.amount),cat=req.body.category_id?Number(req.body.category_id):null,receiptText=String(req.body.receipt_text||"").trim()||null;
+  f.originalname=receiptFileName(vendor,date,amount,f.mimetype,f.originalname);
   const submittedPayment=["credit_card","wire","check","cash"].includes(req.body.payment_method)?req.body.payment_method:null;
   const receiptDetectedPayment=detectPaymentMethodFromText(receiptText);
   const paymentMethod=(receiptDetectedPayment&&receiptDetectedPayment!=="credit_card")?receiptDetectedPayment:submittedPayment;
@@ -662,6 +673,29 @@ app.post("/api/close-month",async(req,res,next)=>{try{
 app.use((err,_req,res,_next)=>{console.error(err);if(err.code==="LIMIT_FILE_SIZE")return res.status(413).json({error:"Receipt must be under 20MB per image"});if(err.statusCode)return res.status(err.statusCode).json({error:err.message});res.status(500).json({error:"Server error"})});
 
 await init();
+try{
+  await pool.query(`UPDATE receipts
+    SET payment_method='credit_card'
+    WHERE transaction_id IS NULL
+      AND (
+        vendor ILIKE '%National Marine%'
+        OR vendor ILIKE '%Hodges%'
+        OR vendor ILIKE '%BJB Marine%'
+        OR file_name ILIKE '%NMS%'
+        OR file_name ILIKE '%Hodges%'
+        OR file_name ILIKE '%BJB%'
+      )`);
+  const legacyRows=(await pool.query(`SELECT id,vendor,receipt_date,amount,content_type,file_name
+    FROM receipts
+    WHERE vendor IS NOT NULL
+      AND (file_name ILIKE 'ChatGPT Image%' OR file_name ILIKE 'Cash%.png' OR file_name ILIKE '%NMS%' OR file_name ILIKE '%Hodges%' OR file_name ILIKE '%BJB%')`)).rows;
+  for(const r of legacyRows){
+    const renamed=receiptFileName(r.vendor,r.receipt_date,r.amount,r.content_type,r.file_name);
+    await pool.query("UPDATE receipts SET file_name=$1 WHERE id=$2",[renamed,r.id]);
+  }
+  console.log("LEGACY_RECEIPT_NORMALIZE complete");
+}catch(e){console.error("LEGACY_RECEIPT_NORMALIZE failed",e)}
+
 
 
 
