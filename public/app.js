@@ -148,7 +148,7 @@ async function loadReceiptInbox(){
       '<div class="muted">'+esc(String(r.receipt_date||'No date').slice(0,10))+' · '+(r.amount==null?'No amount':money(r.amount))+
       ' · '+esc(paymentNames[r.payment_method]||'Payment not confirmed')+'</div>'+
       quality+
-      '<div><span class="badge">'+esc(r.category_name||'Uncategorized')+'</span> · <a target="_blank" href="/api/receipts/'+r.id+'">'+esc(r.file_name||'Receipt')+'</a></div>'+
+      '<div><span class="badge">'+esc(r.category_name||'Uncategorized')+'</span> · <a target="_blank" href="/api/receipts/'+r.id+'">Open full-size receipt</a></div>'+
       (showFix?'<div class="row"><button class="edit-receipt" data-id="'+r.id+'">Review / Fix</button></div>':'<div class="row"><button class="edit-receipt" data-id="'+r.id+'">Review / Fix</button></div>')+
       '</div>';
   };
@@ -174,6 +174,7 @@ async function loadReceiptInbox(){
     $('#ocrStatus').textContent='Reviewing an existing receipt. Correct any field below, confirm payment method, then save.';
     $('#reviewPrompt').textContent='Editing receipt #'+r.id+'. Your corrections will replace the extracted values.';
     $('#uploadReceipt').textContent='Save Corrections';
+    renderExistingReceiptPreview(r.id);
     window.scrollTo({top:document.getElementById('receipts').offsetTop,behavior:'smooth'});
   }));
 }
@@ -199,21 +200,37 @@ function resetReceiptReview(){
   $('#receiptUploadStatus').innerHTML='';
   $('#ocrStatus').className='muted';
   $('#ocrStatus').textContent='';
+  if($('#receiptPreview'))$('#receiptPreview').textContent='Receipt preview will appear here.';
   $('#reviewPrompt').textContent='The system extracted what it could. Review every field, especially amount and payment method, before saving.';
   $('#uploadReceipt').textContent='Confirm & Save Expense';
 }
 
-async function runReceiptOcr(file){
+function renderLocalReceiptPreview(files){
+  const box=$('#receiptPreview'); if(!box)return;
+  const imgs=[...files].filter((f)=>String(f.type||'').startsWith('image/'));
+  if(!imgs.length){box.textContent='Preview unavailable for this file type.';return}
+  const urls=imgs.map((f)=>URL.createObjectURL(f));
+  box.innerHTML='<div class="preview-strip">'+urls.map((u,i)=>'<img src="'+u+'" alt="Receipt page '+(i+1)+'">').join('')+'</div>';
+}
+function renderExistingReceiptPreview(id){
+  const box=$('#receiptPreview'); if(!box)return;
+  box.innerHTML='<img src="/api/receipts/'+encodeURIComponent(id)+'" alt="Receipt preview">';
+}
+
+async function runReceiptOcr(files){
   const status=$('#ocrStatus');
-  if(!file||!status)return;
+  const list=[...files];
+  if(!list.length||!status)return;
   status.className='muted';
-  status.textContent='Reading receipt image…';
-  if(file.type==='application/pdf'||/\.pdf$/i.test(file.name||'')){
+  status.textContent='Reading '+list.length+' receipt image'+(list.length>1?'s':'')+'…';
+  if(list.some((f)=>f.type==='application/pdf'||/\.pdf$/i.test(f.name||''))){
     status.className='warn';
-    status.textContent='PDF attached. OCR is not enabled for PDFs yet. Review and enter the fields manually before saving.';
+    status.textContent=list.length>1
+      ? 'Multi-image bundles currently support photos only. PDFs must be reviewed separately.'
+      : 'PDF attached. OCR is not enabled for PDFs yet. Review and enter the fields manually before saving.';
     return;
   }
-  const fd=new FormData();fd.append('file',file);
+  const fd=new FormData();list.forEach((f)=>fd.append('files',f));
   try{
     const r=await api('ocr',{method:'POST',body:fd});
     $('#rDate').value=r.receipt_date||'';
@@ -230,12 +247,12 @@ async function runReceiptOcr(file){
     const score=Number(r.field_score)||0;
     status.className=missing.length?'warn':'ok';
     status.textContent=missing.length
-      ? score+'/5 key fields found. Review '+missing.join(', ')+'. Nothing has been saved.'
-      : '5/5 key fields found. Review the extracted values, then click Confirm & Save Expense. Nothing has been saved yet.';
+      ? score+'/5 key fields found across '+(r.page_count||list.length)+' image(s). Review '+missing.join(', ')+'. Nothing has been saved.'
+      : '5/5 key fields found across '+(r.page_count||list.length)+' image(s). Review the extracted values, then click Confirm & Save Expense.';
   }catch(e){
     console.error(e);
     status.className='warn';
-    status.textContent='Could not read this image automatically. Enter the fields manually, confirm payment method, and save.';
+    status.textContent='Could not read this receipt bundle automatically. Enter the fields manually, confirm payment method, and save.';
   }
 }
 function renderReceiptForm(){
@@ -376,10 +393,11 @@ async function runSystemCheck(){
 
 function wireStaticControls(){
   if($('#rFile')) $('#rFile').addEventListener('change',()=>{
-    const f=$('#rFile').files&&$('#rFile').files[0];
-    if(!f)return;
+    const files=$('#rFile').files;
+    if(!files||!files.length)return;
     resetReceiptReview();
-    runReceiptOcr(f).catch(console.error);
+    renderLocalReceiptPreview(files);
+    runReceiptOcr(files).catch(console.error);
   });
   const monthEl=$('#month');
   if(monthEl){monthEl.value=new Date().toISOString().slice(0,7);monthEl.addEventListener('change',()=>Promise.all([loadDashboard(),loadTransactions()]));}
@@ -432,9 +450,10 @@ function wireStaticControls(){
       return;
     }
 
-    const f=$('#rFile').files&&$('#rFile').files[0]; if(!f) return toast('Choose a receipt image or PDF');
+    const files=$('#rFile').files; if(!files||!files.length) return toast('Choose one or more receipt images');
     const fd=new FormData();
-    fd.append('file',f);fd.append('receipt_date',$('#rDate').value);fd.append('vendor',$('#rVendor').value.trim());fd.append('amount',$('#rAmount').value);
+    [...files].forEach((f)=>fd.append('files',f));
+    fd.append('receipt_date',$('#rDate').value);fd.append('vendor',$('#rVendor').value.trim());fd.append('amount',$('#rAmount').value);
     fd.append('payment_method',payment);fd.append('payment_reference',$('#rReference').value);fd.append('receipt_text',$('#rText').value);
     if($('#rCategory').value) fd.append('category_id',$('#rCategory').value);
     const r=await api('receipts',{method:'POST',body:fd});
