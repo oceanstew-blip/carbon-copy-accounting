@@ -64,7 +64,7 @@ async function init(){
       id BIGSERIAL PRIMARY KEY,month_start DATE NOT NULL UNIQUE,calculated_total NUMERIC(12,2),closed BOOLEAN NOT NULL DEFAULT FALSE,closed_at TIMESTAMPTZ);
   `);
   await pool.query("INSERT INTO cards(label,last4) VALUES($1,$2) ON CONFLICT(last4) DO NOTHING",["Capital One","0945"]);
-  const cats=["Fuel & Lubricants","Dockage / Marina","Repairs & Maintenance","Provisions","Supplies","Insurance","Communications / Internet","Crew Travel","Crew Meals","Training / Certifications","Safety Equipment","Tender / Toys","Professional Services","Shipping / Freight","Customs / Port Fees","Guest Expenses","Transportation","Capital Improvements","Owner / Personal","Miscellaneous"];
+  const cats=["Fuel & Lubricants","Dockage / Marina","Repairs & Maintenance","Provisions","Supplies","Insurance","Communications / Internet","Crew Travel","Crew Meals","Training / Certifications","Safety Equipment","Tender / Toys","Professional Services","Shipping / Freight","Customs / Port Fees","Guest Expenses","Transportation","Capital Improvements","Owner / Personal","Navigation / Weather","Miscellaneous"];
   for(let i=0;i<cats.length;i++)await pool.query("INSERT INTO categories(name,sort_order) VALUES($1,$2) ON CONFLICT(name) DO NOTHING",[cats[i],(i+1)*10]);
   await seedInitialData();
 }
@@ -77,8 +77,12 @@ function csvDate(v){const d=new Date(v);return !isNaN(d)?d.toISOString().slice(0
 async function seedInitialData(){
   for(const [pattern,category] of initialRules){
     const c=(await pool.query("SELECT id FROM categories WHERE name=$1",[category])).rows[0];
-    if(c)await pool.query(`INSERT INTO vendor_rules(vendor_pattern,category_id) VALUES($1,$2)
-      ON CONFLICT(vendor_pattern) DO UPDATE SET category_id=EXCLUDED.category_id,approved=true`,[pattern,c.id]);
+    if(c){
+      await pool.query(`INSERT INTO vendor_rules(vendor_pattern,category_id) VALUES($1,$2)
+        ON CONFLICT(vendor_pattern) DO UPDATE SET category_id=EXCLUDED.category_id,approved=true`,[pattern,c.id]);
+      await pool.query(`UPDATE transactions SET category_id=$1,captain_reviewed=true,updated_at=NOW()
+        WHERE category_id IS NULL AND vendor_raw ILIKE '%'||$2||'%'`,[c.id,pattern]);
+    }
   }
   const lines=capitalOneCsv.replace(/\r/g,"").split("\n").filter(Boolean),headers=parseCsvLine(lines[0]).map(x=>x.toLowerCase().replace(/\./g,"").trim());
   const ix=n=>headers.findIndex(h=>h===n),card=(await pool.query("SELECT id FROM cards WHERE last4='0945' LIMIT 1")).rows[0];
@@ -91,6 +95,9 @@ async function seedInitialData(){
     await pool.query(`INSERT INTO transactions(transaction_date,posted_date,vendor_raw,vendor_normalized,amount,category_id,card_id,source,external_id,status)
       VALUES($1,$2,$3,$3,$4,$5,$6,'capital-one-csv',$7,'posted') ON CONFLICT DO NOTHING`,
       [row.transaction_date,row.posted_date,row.vendor_raw,row.amount,rule?.category_id||null,card?.id||null,ext]);
+    if(rule?.category_id){
+      await pool.query("UPDATE transactions SET captain_reviewed=true WHERE external_id=$1",[ext]);
+    }
   }
   for(const r of driveReceipts){
     const c=(await pool.query("SELECT id FROM categories WHERE name=$1",[r.category])).rows[0];
@@ -115,7 +122,7 @@ async function autoMatchReceipt(receiptId){
   if(q.rows.length!==1)return null;
   const t=q.rows[0];
   await pool.query("UPDATE receipts SET transaction_id=$1 WHERE id=$2",[t.id,r.id]);
-  if(r.category_id)await pool.query("UPDATE transactions SET category_id=COALESCE(category_id,$1),updated_at=NOW() WHERE id=$2",[r.category_id,t.id]);
+  if(r.category_id)await pool.query("UPDATE transactions SET category_id=COALESCE(category_id,$1),captain_reviewed=true,updated_at=NOW() WHERE id=$2",[r.category_id,t.id]);
   return t.id;
 }
 async function matchAllReceipts(){
