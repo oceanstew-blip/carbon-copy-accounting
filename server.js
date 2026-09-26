@@ -64,29 +64,43 @@ function suggestedCategoryFromText(text){
 }
 function parseOcrReceipt(text){
   const lines=String(text||"").split(/\r?\n/).map((x)=>x.replace(/\s+/g," ").trim()).filter(Boolean);
-  const totalPriority=[
-    /\bgrand\s*total\b/i,/\bamount\s*due\b/i,/\bbalance\s*due\b/i,/\btotal\b/i
-  ];
+  const paymentText=lines.join(" ").toLowerCase();
+  let detected_payment_method=null;
+  if(/\b(payment|tender(?:ed)?|paid)\s*:?\s*cash\b|\bcash\s+(tendered|payment)\b/i.test(paymentText)) detected_payment_method="cash";
+  else if(/\b(payment|paid)\s*:?\s*check\b|\bcheck\s*#?/i.test(paymentText)) detected_payment_method="check";
+  else if(/\b(payment|paid)\s*:?\s*wire\b|\bwire\s+(transfer|payment)\b/i.test(paymentText)) detected_payment_method="wire";
+  else if(/\b(visa|mastercard|amex|american express|discover|credit card|card ending|card #)\b/i.test(paymentText)) detected_payment_method="credit_card";
+
   let amount=null;
-  for(const re of totalPriority){
-    const candidates=lines.filter((line)=>re.test(line)&&!/subtotal/i.test(line));
-    for(let i=candidates.length-1;i>=0;i--){const a=amountFromLine(candidates[i]);if(a!==null){amount=a;break}}
-    if(amount!==null)break;
-  }
+  const exactTotal=lines.filter((line)=>
+    /^(?:grand\s+total|total|amount\s+due|balance\s+due)\b/i.test(line) &&
+    !/subtotal|cash tendered|tendered|change|tip|gratuity/i.test(line)
+  );
+  for(let i=exactTotal.length-1;i>=0;i--){const a=amountFromLine(exactTotal[i]);if(a!==null){amount=a;break}}
   if(amount===null){
-    const all=lines.flatMap((line)=>{const a=amountFromLine(line);return a===null?[]:[a]})
-      .filter((n)=>n>=0&&n<1000000);
-    if(all.length)amount=Math.max(...all);
+    const containsTotal=lines.filter((line)=>
+      /\b(grand\s+total|amount\s+due|balance\s+due|total)\b/i.test(line) &&
+      !/subtotal|cash tendered|tendered|change|tip|gratuity/i.test(line)
+    );
+    for(let i=containsTotal.length-1;i>=0;i--){const a=amountFromLine(containsTotal[i]);if(a!==null){amount=a;break}}
   }
+
   let receipt_date=null;
   for(const line of lines){receipt_date=isoReceiptDate(line);if(receipt_date)break}
-  const reject=/\b(receipt|invoice|thank you|welcome|www\.|http|tel\b|phone\b|date\b|time\b|cashier\b|register\b|transaction\b|order\b|subtotal\b|total\b|tax\b|visa\b|mastercard\b|amex\b)\b/i;
-  const vendor=lines.slice(0,12).find((line)=>
+
+  const reject=/\b(receipt|invoice|thank you|welcome|www\.|http|tel\b|phone\b|date\b|time\b|cashier\b|register\b|transaction\b|order\b|subtotal\b|total\b|tax\b|visa\b|mastercard\b|amex\b|payment\b|cash\b|change\b)\b/i;
+  const vendor=lines.slice(0,10).find((line)=>
     line.length>=3&&line.length<=70&&!reject.test(line)&&
     !/^\W*[\d\s#()+.\/-]+\W*$/.test(line)&&
-    !/^\d+\s+\w+\s+(st|street|ave|avenue|rd|road|blvd|drive|dr)\b/i.test(line)
+    !/^\d+\s+\w+\s+(st|street|ave|avenue|rd|road|blvd|drive|dr|hwy|highway)\b/i.test(line)
   )||null;
-  return {vendor,receipt_date,amount,receipt_text:lines.join("\n"),suggested_category:suggestedCategoryFromText(text)};
+
+  return {
+    vendor,receipt_date,amount,
+    receipt_text:lines.join("\n"),
+    suggested_category:suggestedCategoryFromText(text),
+    detected_payment_method
+  };
 }
 async function ocrImage(buffer){
   const prepared=await sharp(buffer,{failOn:"none"}).rotate().resize({width:2200,height:2200,fit:"inside",withoutEnlargement:true}).grayscale().normalize().png().toBuffer();
@@ -347,7 +361,7 @@ app.post("/api/vendor-rules",async(req,res,next)=>{try{
 }catch(e){next(e)}});
 
 app.get("/api/receipt-inbox",async(_req,res,next)=>{try{
-  const q=await pool.query(`SELECT r.id,r.receipt_date,r.vendor,r.amount,r.file_name,r.created_at,r.expires_at,r.purged_at,r.receipt_text,c.name category_name,c.id category_id
+  const q=await pool.query(`SELECT r.id,r.receipt_date,r.vendor,r.amount,r.file_name,r.created_at,r.expires_at,r.purged_at,r.receipt_text,r.payment_method,r.payment_reference,c.name category_name,c.id category_id
     FROM receipts r LEFT JOIN categories c ON c.id=r.category_id WHERE r.transaction_id IS NULL ORDER BY COALESCE(r.receipt_date,r.created_at::date) DESC,r.id DESC`);
   res.json({rows:q.rows})
 }catch(e){next(e)}});
@@ -359,7 +373,8 @@ app.post("/api/receipts",upload.single("file"),async(req,res,next)=>{try{
   const sha=crypto.createHash("sha256").update(f.buffer).digest("hex");
   let tid=req.body.transaction_id?Number(req.body.transaction_id):null;
   const date=req.body.receipt_date||null,vendor=String(req.body.vendor||"").trim()||null,amount=moneyNum(req.body.amount),cat=req.body.category_id?Number(req.body.category_id):null,receiptText=String(req.body.receipt_text||"").trim()||null;
-  const paymentMethod=["credit_card","wire","check","cash"].includes(req.body.payment_method)?req.body.payment_method:"credit_card";
+  const paymentMethod=["credit_card","wire","check","cash"].includes(req.body.payment_method)?req.body.payment_method:null;
+  if(!paymentMethod)return res.status(400).json({error:"Confirm the payment method before saving this receipt"});
   const paymentReference=String(req.body.payment_reference||"").trim()||null;
   const existing=(await pool.query("SELECT * FROM receipts WHERE file_sha256=$1",[sha])).rows[0];
   if(existing){
@@ -410,11 +425,39 @@ app.post("/api/receipts",upload.single("file"),async(req,res,next)=>{try{
 
 app.patch("/api/receipts/:id",async(req,res,next)=>{try{
   const id=Number(req.params.id),b=req.body;
-  await pool.query("UPDATE receipts SET receipt_date=COALESCE($1,receipt_date),vendor=COALESCE($2,vendor),amount=COALESCE($3,amount),category_id=COALESCE($4,category_id),receipt_text=COALESCE($5,receipt_text) WHERE id=$6",[
-    b.receipt_date||null,b.vendor||null,b.amount==null?null:moneyNum(b.amount),b.category_id==null?null:Number(b.category_id),b.receipt_text||null,id]);
-  const matched=await autoMatchReceipt(id);res.json({ok:true,matched_transaction_id:matched})
-}catch(e){next(e)}});
+  if(!Number.isFinite(id))return res.status(400).json({error:"Invalid receipt id"});
+  const current=(await pool.query("SELECT * FROM receipts WHERE id=$1",[id])).rows[0];
+  if(!current)return res.status(404).json({error:"Receipt not found"});
 
+  const date=b.receipt_date===undefined?current.receipt_date:b.receipt_date||null;
+  const vendor=b.vendor===undefined?current.vendor:String(b.vendor||"").trim()||null;
+  const amount=b.amount===undefined?(current.amount==null?null:Number(current.amount)):moneyNum(b.amount);
+  const categoryId=b.category_id===undefined?current.category_id:(b.category_id?Number(b.category_id):null);
+  const receiptText=b.receipt_text===undefined?current.receipt_text:String(b.receipt_text||"").trim()||null;
+  const paymentMethod=b.payment_method===undefined?current.payment_method:(["credit_card","wire","check","cash"].includes(b.payment_method)?b.payment_method:null);
+  const paymentReference=b.payment_reference===undefined?current.payment_reference:String(b.payment_reference||"").trim()||null;
+  if(!paymentMethod)return res.status(400).json({error:"Confirm the payment method before saving"});
+
+  await pool.query(`UPDATE receipts SET receipt_date=$1,vendor=$2,amount=$3,category_id=$4,receipt_text=$5,payment_method=$6,payment_reference=$7 WHERE id=$8`,
+    [date,vendor,amount,categoryId,receiptText,paymentMethod,paymentReference,id]);
+
+  let createdTransactionId=null,matched=null;
+  if(!current.transaction_id && paymentMethod!=="credit_card"){
+    if(!date||!vendor||amount===null)return res.status(400).json({error:"Date, vendor, and amount are required for cash, check, or wire"});
+    const rule=(await pool.query("SELECT category_id FROM vendor_rules WHERE $1 ILIKE '%'||vendor_pattern||'%' ORDER BY length(vendor_pattern) DESC LIMIT 1",[vendor])).rows[0];
+    const chosenCategory=categoryId||rule?.category_id||null;
+    const ext=crypto.createHash("sha256").update(["receipt-correction",id,String(date).slice(0,10),paymentMethod,paymentReference||"",vendor.toUpperCase(),Number(amount).toFixed(2)].join("|")).digest("hex");
+    const tr=await pool.query(`INSERT INTO transactions(transaction_date,posted_date,vendor_raw,vendor_normalized,amount,category_id,card_id,source,external_id,status,payment_method,payment_reference,captain_reviewed)
+      VALUES($1,$1,$2,$2,$3,$4,NULL,'receipt-correction',$5,'posted',$6,$7,$8)
+      ON CONFLICT(external_id) WHERE external_id IS NOT NULL DO NOTHING RETURNING id`,
+      [date,vendor,amount,chosenCategory,ext,paymentMethod,paymentReference,Boolean(chosenCategory)]);
+    createdTransactionId=tr.rows[0]?.id||((await pool.query("SELECT id FROM transactions WHERE external_id=$1 LIMIT 1",[ext])).rows[0]?.id||null);
+    if(createdTransactionId)await pool.query("UPDATE receipts SET transaction_id=$1,category_id=COALESCE(category_id,$2) WHERE id=$3",[createdTransactionId,chosenCategory,id]);
+  }else if(!current.transaction_id && paymentMethod==="credit_card"){
+    matched=await autoMatchReceipt(id);
+  }
+  res.json({ok:true,created_transaction_id:createdTransactionId,matched_transaction_id:matched,payment_method:paymentMethod});
+}catch(e){next(e)}});
 app.get("/api/receipts/:id",async(req,res,next)=>{try{
   const q=await pool.query("SELECT file_name,content_type,file_data,source_url,purged_at FROM receipts WHERE id=$1",[Number(req.params.id)]);const r=q.rows[0];if(!r)return res.sendStatus(404);
   if(r.purged_at)return res.status(410).send("Receipt file expired after 60 days.");
