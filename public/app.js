@@ -2,6 +2,7 @@
 let bootstrap={categories:[],cards:[],rules:[]};
 let transactions=[];
 let receiptInbox=[];
+let editingReceiptId=null;
 
 const $=(s)=>document.querySelector(s);
 const $$=(s)=>Array.from(document.querySelectorAll(s));
@@ -136,10 +137,33 @@ async function loadReceiptInbox(){
   receiptInbox=d.rows||[];
   const el=$('#receiptInbox'); if(!el) return;
   el.innerHTML=receiptInbox.length?receiptInbox.map((r)=>{
-    return '<div class="receipt-item"><b>'+esc(r.vendor||r.file_name||'Receipt')+'</b><div class="muted">'+esc(String(r.receipt_date||'No date').slice(0,10))+' · '+(r.amount==null?'No amount':money(r.amount))+'</div><div><span class="badge">'+esc(r.category_name||'Uncategorized')+'</span> · <a target="_blank" href="/api/receipts/'+r.id+'">'+esc(r.file_name||'Receipt')+'</a></div></div>';
+    const paymentNames={credit_card:'Credit Card',cash:'Cash',wire:'Wire',check:'Check'};
+    return '<div class="receipt-item"><b>'+esc(r.vendor||r.file_name||'Receipt')+'</b>'+
+      '<div class="muted">'+esc(String(r.receipt_date||'No date').slice(0,10))+' · '+(r.amount==null?'No amount':money(r.amount))+
+      ' · '+esc(paymentNames[r.payment_method]||'Payment not confirmed')+'</div>'+
+      '<div><span class="badge">'+esc(r.category_name||'Uncategorized')+'</span> · <a target="_blank" href="/api/receipts/'+r.id+'">'+esc(r.file_name||'Receipt')+'</a></div>'+
+      '<div class="row"><button class="edit-receipt" data-id="'+r.id+'">Review / Fix</button></div></div>';
   }).join(''):'<p class="muted">Nothing waiting. All card receipts are matched.</p>';
-}
 
+  $$('.edit-receipt').forEach((btn)=>btn.addEventListener('click',()=>{
+    const r=receiptInbox.find((x)=>String(x.id)===String(btn.dataset.id));
+    if(!r)return;
+    editingReceiptId=r.id;
+    $('#rFile').value='';
+    $('#rDate').value=String(r.receipt_date||'').slice(0,10);
+    $('#rVendor').value=r.vendor||'';
+    $('#rAmount').value=r.amount==null?'':Number(r.amount).toFixed(2);
+    $('#rPayment').value=r.payment_method||'';
+    $('#rReference').value=r.payment_reference||'';
+    $('#rText').value=r.receipt_text||'';
+    $('#rCategory').value=r.category_id?String(r.category_id):'';
+    $('#ocrStatus').className='warn';
+    $('#ocrStatus').textContent='Reviewing an existing waiting receipt. Correct any field below, confirm payment method, then save.';
+    $('#reviewPrompt').textContent='Editing waiting receipt #'+r.id+'. Your corrections will replace the extracted values.';
+    $('#uploadReceipt').textContent='Save Corrections';
+    window.scrollTo({top:document.getElementById('receipts').offsetTop,behavior:'smooth'});
+  }));
+}
 function renderRules(){
   const cats=$('#categoryList');
   if(cats) cats.innerHTML=(bootstrap.categories||[]).map((c)=>'<div class="category-item">'+esc(c.name)+'</div>').join('');
@@ -150,43 +174,60 @@ function renderRules(){
 }
 
 
+function resetReceiptReview(){
+  editingReceiptId=null;
+  $('#rDate').value='';
+  $('#rVendor').value='';
+  $('#rAmount').value='';
+  $('#rPayment').value='';
+  $('#rReference').value='';
+  $('#rText').value='';
+  $('#rCategory').value='';
+  $('#receiptUploadStatus').innerHTML='';
+  $('#ocrStatus').className='muted';
+  $('#ocrStatus').textContent='';
+  $('#reviewPrompt').textContent='The system extracted what it could. Review every field, especially amount and payment method, before saving.';
+  $('#uploadReceipt').textContent='Confirm & Save Expense';
+}
+
 async function runReceiptOcr(file){
   const status=$('#ocrStatus');
   if(!file||!status)return;
   status.className='muted';
   status.textContent='Reading receipt image…';
   if(file.type==='application/pdf'||/\.pdf$/i.test(file.name||'')){
-    status.textContent='PDF attached. OCR is not enabled for PDFs yet; enter the fields manually.';
+    status.className='warn';
+    status.textContent='PDF attached. OCR is not enabled for PDFs yet. Review and enter the fields manually before saving.';
     return;
   }
   const fd=new FormData();fd.append('file',file);
   try{
     const r=await api('ocr',{method:'POST',body:fd});
-    if(r.receipt_date&&!$('#rDate').value)$('#rDate').value=r.receipt_date;
-    if(r.vendor&&!$('#rVendor').value)$('#rVendor').value=r.vendor;
-    if(r.amount!=null&&!$('#rAmount').value)$('#rAmount').value=Number(r.amount).toFixed(2);
-    if(r.receipt_text&&!$('#rText').value)$('#rText').value=r.receipt_text;
-    if(r.suggested_category&&!$('#rCategory').value){
+    $('#rDate').value=r.receipt_date||'';
+    $('#rVendor').value=r.vendor||'';
+    $('#rAmount').value=r.amount==null?'':Number(r.amount).toFixed(2);
+    $('#rText').value=r.receipt_text||'';
+    $('#rPayment').value=r.detected_payment_method||'';
+    $('#rCategory').value='';
+    if(r.suggested_category){
       const cat=(bootstrap.categories||[]).find((c)=>c.name===r.suggested_category);
       if(cat)$('#rCategory').value=String(cat.id);
     }
-    const found=[
-      r.vendor?'vendor':'',
-      r.receipt_date?'date':'',
-      r.amount!=null?'amount':'',
-      r.suggested_category?'category':''
-    ].filter(Boolean);
-    status.className=found.length?'ok':'warn';
-    status.textContent=found.length
-      ? 'Receipt read ('+(Number(r.confidence)||0)+'% OCR confidence). Review the prefilled fields before saving.'
-      : 'OCR finished but could not confidently identify the key fields. Enter them manually.';
+    const missing=[];
+    if(!r.vendor)missing.push('vendor');
+    if(!r.receipt_date)missing.push('date');
+    if(r.amount==null)missing.push('amount');
+    if(!r.detected_payment_method)missing.push('payment method');
+    status.className=missing.length?'warn':'ok';
+    status.textContent=missing.length
+      ? 'OCR read the receipt, but you must review it. Check '+missing.join(', ')+'. OCR confidence '+(Number(r.confidence)||0)+'%. Nothing has been saved.'
+      : 'Receipt extracted. OCR confidence '+(Number(r.confidence)||0)+'%. Review every field below, then click Confirm & Save Expense. Nothing has been saved yet.';
   }catch(e){
     console.error(e);
     status.className='warn';
-    status.textContent='Could not read this image automatically. You can still enter the fields manually and save it.';
+    status.textContent='Could not read this image automatically. Enter the fields manually, confirm payment method, and save.';
   }
 }
-
 function renderReceiptForm(){
   const sel=$('#rCategory'); if(!sel) return;
   sel.innerHTML='<option value="">Choose category</option>'+(bootstrap.categories||[]).map((c)=>'<option value="'+c.id+'">'+esc(c.name)+'</option>').join('');
@@ -326,7 +367,9 @@ async function runSystemCheck(){
 function wireStaticControls(){
   if($('#rFile')) $('#rFile').addEventListener('change',()=>{
     const f=$('#rFile').files&&$('#rFile').files[0];
-    if(f) runReceiptOcr(f).catch(console.error);
+    if(!f)return;
+    resetReceiptReview();
+    runReceiptOcr(f).catch(console.error);
   });
   const monthEl=$('#month');
   if(monthEl){monthEl.value=new Date().toISOString().slice(0,7);monthEl.addEventListener('change',()=>Promise.all([loadDashboard(),loadTransactions()]));}
@@ -354,19 +397,47 @@ function wireStaticControls(){
   });
 
   if($('#uploadReceipt')) $('#uploadReceipt').addEventListener('click',async()=>{
+    const payment=$('#rPayment').value;
+    if(!payment)return toast('Confirm the payment method before saving');
+    if(!$('#rDate').value||!$('#rVendor').value.trim()||!$('#rAmount').value)return toast('Review date, vendor, and amount before saving');
+
+    if(editingReceiptId){
+      const r=await api('receipts/'+editingReceiptId,{method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify({
+        receipt_date:$('#rDate').value,
+        vendor:$('#rVendor').value.trim(),
+        amount:Number($('#rAmount').value),
+        payment_method:payment,
+        payment_reference:$('#rReference').value,
+        receipt_text:$('#rText').value,
+        category_id:$('#rCategory').value?Number($('#rCategory').value):null
+      })});
+      let msg='Corrections saved.';
+      if(r.created_transaction_id) msg='Corrected and posted as '+String(payment).replace('_',' ').toUpperCase()+'.';
+      else if(r.matched_transaction_id) msg='Corrected and matched to the credit-card transaction.';
+      else if(payment==='credit_card') msg='Corrected. Waiting for the matching credit-card transaction.';
+      $('#receiptUploadStatus').innerHTML='<p class="ok">'+esc(msg)+'</p>';
+      editingReceiptId=null;
+      $('#uploadReceipt').textContent='Confirm & Save Expense';
+      await Promise.all([loadReceiptInbox(),loadTransactions(),loadDashboard()]);
+      return;
+    }
+
     const f=$('#rFile').files&&$('#rFile').files[0]; if(!f) return toast('Choose a receipt image or PDF');
     const fd=new FormData();
-    fd.append('file',f);fd.append('receipt_date',$('#rDate').value);fd.append('vendor',$('#rVendor').value);fd.append('amount',$('#rAmount').value);
-    fd.append('payment_method',$('#rPayment').value);fd.append('payment_reference',$('#rReference').value);fd.append('receipt_text',$('#rText').value);
+    fd.append('file',f);fd.append('receipt_date',$('#rDate').value);fd.append('vendor',$('#rVendor').value.trim());fd.append('amount',$('#rAmount').value);
+    fd.append('payment_method',payment);fd.append('payment_reference',$('#rReference').value);fd.append('receipt_text',$('#rText').value);
     if($('#rCategory').value) fd.append('category_id',$('#rCategory').value);
     const r=await api('receipts',{method:'POST',body:fd});
     const nonCard=['cash','wire','check'].includes(r.payment_method);
     let msg='Saved.';
-    if(r.duplicate&&r.promoted) msg='Existing receipt converted to '+String(r.payment_method).toUpperCase()+' and added to Transactions.';
-    else if(r.duplicate) msg='Already uploaded.';
+    if(r.duplicate&&r.promoted) msg='Existing receipt corrected to '+String(r.payment_method).toUpperCase()+' and added to Transactions.';
+    else if(r.duplicate) msg='This receipt was already uploaded. Use Review / Fix in Waiting to Match if it needs correction.';
     else if(nonCard&&r.created_transaction_id) msg='Saved as '+String(r.payment_method).toUpperCase()+' and added to Transactions.';
     else if(r.matched_transaction_id) msg='Saved and matched to the credit-card transaction.';
     else msg='Saved. Waiting for the matching credit-card transaction.';
+    $('#receiptUploadStatus').innerHTML='<p class="ok">'+esc(msg)+'</p>';
+    $('#rFile').value='';
+    resetReceiptReview();
     $('#receiptUploadStatus').innerHTML='<p class="ok">'+esc(msg)+'</p>';
     await Promise.all([loadReceiptInbox(),loadTransactions(),loadDashboard()]);
   });
