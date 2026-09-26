@@ -558,6 +558,9 @@ async function repairOrphanNonCardReceipts(){
   return repaired;
 }
 
+const ORPHAN_NONCARD_STARTUP_REPAIR=await repairOrphanNonCardReceipts();
+console.log("ORPHAN_NONCARD_STARTUP_REPAIR",ORPHAN_NONCARD_STARTUP_REPAIR);
+
 app.get("/api/receipt-inbox",async(_req,res,next)=>{try{
   await repairOrphanNonCardReceipts();
   const q=await pool.query(`SELECT r.id,r.receipt_date,r.vendor,r.amount,r.file_name,r.created_at,r.expires_at,r.purged_at,r.receipt_text,r.payment_method,r.payment_reference,
