@@ -287,6 +287,145 @@ async function runSystemCheck(){
     return 'Server-side OCR ready · manual fallback available';
   });
 
+  await test('OCR engine self-test',async()=>{
+    const d=await api('ocr/self-test');
+    if(!d.ok) throw new Error('OCR engine failed synthetic receipt test');
+    return 'Read synthetic receipt · '+(d.confidence||0)+'% confidence · 
+  await test('Reports API',async()=>{
+    const m=currentMonth().split('-');
+    const d=await api('report?scope=month&year='+encodeURIComponent(m[0])+'&month='+encodeURIComponent(Number(m[1])));
+    if(!d.summary) throw new Error('Missing report summary');
+    return String(d.summary.transaction_count||0)+' transactions · '+money(d.summary.total);
+  });
+
+  await test('Cash workflow visibility',async()=>{
+    const cash=txRows.filter((t)=>t.payment_method==='cash');
+    if(!cash.length) return 'No cash transactions in '+currentMonth()+' yet';
+    const linked=cash.filter((t)=>t.receipt_id).length;
+    return cash.length+' cash transaction(s) · '+linked+' with linked receipt(s)';
+  });
+
+  await test('Receipt file endpoint',async()=>{
+    const t=txRows.find((x)=>x.receipt_id);
+    if(!t) return 'No linked receipt available to probe';
+    const r=await fetch('/api/receipts/'+t.receipt_id,{method:'HEAD',redirect:'manual'});
+    if(!(r.ok||r.type==='opaqueredirect'||(r.status>=300&&r.status<400))) throw new Error('HTTP '+r.status);
+    return (t.file_name||('Receipt #'+t.receipt_id))+' reachable';
+  });
+
+  const passed=results.filter((r)=>r.ok).length;
+  const failed=results.length-passed;
+  summary.className=failed?'system-summary warn':'system-summary ok';
+  summary.textContent=failed?passed+' passed · '+failed+' failed':passed+' of '+results.length+' checks passed';
+  box.innerHTML=results.map((r)=>'<div class="check-item '+(r.ok?'pass':'fail')+'"><div><b>'+(r.ok?'PASS':'FAIL')+'</b> '+esc(r.name)+'</div><span>'+esc(r.detail)+'</span></div>').join('');
+
+  if(details&&txRows.length){
+    const cash=txRows.filter((t)=>t.payment_method==='cash');
+    details.innerHTML='<h3>Current-month cash transactions</h3>'+(cash.length
+      ? '<div class="table-wrap"><table><thead><tr><th>Date</th><th>Vendor</th><th>Amount</th><th>Receipt</th></tr></thead><tbody>'+cash.map((t)=>'<tr><td>'+esc(String(t.transaction_date||'').slice(0,10))+'</td><td>'+esc(t.vendor_normalized||t.vendor_raw||'')+'</td><td>'+money(t.amount)+'</td><td>'+(t.receipt_id?'<a class="receipt-link" target="_blank" href="/api/receipts/'+t.receipt_id+'">'+esc(t.file_name||'Receipt')+'</a>':'Missing')+'</td></tr>').join('')+'</tbody></table></div>'
+      : '<p class="muted">No cash transactions found for '+esc(currentMonth())+'.</p>');
+  }
+}
+
+function wireStaticControls(){
+  if($('#rFile')) $('#rFile').addEventListener('change',()=>{
+    const f=$('#rFile').files&&$('#rFile').files[0];
+    if(f) runReceiptOcr(f).catch(console.error);
+  });
+  const monthEl=$('#month');
+  if(monthEl){monthEl.value=new Date().toISOString().slice(0,7);monthEl.addEventListener('change',()=>Promise.all([loadDashboard(),loadTransactions()]));}
+  if($('#refresh')) $('#refresh').addEventListener('click',()=>Promise.all([loadDashboard(),loadTransactions(),loadReceiptInbox()]));
+  if($('#runSystemCheck')) $('#runSystemCheck').addEventListener('click',()=>runSystemCheck().catch((e)=>{console.error(e);toast('System check failed to run');}));
+  if($('#txFilter')) $('#txFilter').addEventListener('change',renderTransactions);
+  if($('#sortBy')) $('#sortBy').addEventListener('change',renderTransactions);
+  if($('#sortDir')) $('#sortDir').addEventListener('change',renderTransactions);
+
+  if($('#importCsv')) $('#importCsv').addEventListener('click',async()=>{
+    const f=$('#csvFile').files&&$('#csvFile').files[0]; if(!f) return toast('Choose a CSV first');
+    const rows=parseCSV(await f.text());
+    const r=await api('transactions',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({rows})});
+    $('#importStatus').innerHTML='<p class="ok">Imported '+r.inserted+'; skipped '+r.skipped+' duplicates/invalid; matched '+(r.receipts_matched||0)+' waiting receipts.</p>';
+    await Promise.all([loadDashboard(),loadTransactions(),loadReceiptInbox()]);
+  });
+
+  if($('#addManual')) $('#addManual').addEventListener('click',async()=>{
+    await api('transactions',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({
+      transaction_date:$('#mDate').value,vendor_raw:$('#mVendor').value,amount:Number($('#mAmount').value),
+      source:'manual',payment_method:$('#mPayment').value,payment_reference:$('#mReference').value
+    })});
+    toast('Expense added');
+    await Promise.all([loadDashboard(),loadTransactions()]);
+  });
+
+  if($('#uploadReceipt')) $('#uploadReceipt').addEventListener('click',async()=>{
+    const f=$('#rFile').files&&$('#rFile').files[0]; if(!f) return toast('Choose a receipt image or PDF');
+    const fd=new FormData();
+    fd.append('file',f);fd.append('receipt_date',$('#rDate').value);fd.append('vendor',$('#rVendor').value);fd.append('amount',$('#rAmount').value);
+    fd.append('payment_method',$('#rPayment').value);fd.append('payment_reference',$('#rReference').value);fd.append('receipt_text',$('#rText').value);
+    if($('#rCategory').value) fd.append('category_id',$('#rCategory').value);
+    const r=await api('receipts',{method:'POST',body:fd});
+    const nonCard=['cash','wire','check'].includes(r.payment_method);
+    let msg='Saved.';
+    if(r.duplicate&&r.promoted) msg='Existing receipt converted to '+String(r.payment_method).toUpperCase()+' and added to Transactions.';
+    else if(r.duplicate) msg='Already uploaded.';
+    else if(nonCard&&r.created_transaction_id) msg='Saved as '+String(r.payment_method).toUpperCase()+' and added to Transactions.';
+    else if(r.matched_transaction_id) msg='Saved and matched to the credit-card transaction.';
+    else msg='Saved. Waiting for the matching credit-card transaction.';
+    $('#receiptUploadStatus').innerHTML='<p class="ok">'+esc(msg)+'</p>';
+    await Promise.all([loadReceiptInbox(),loadTransactions(),loadDashboard()]);
+  });
+
+  if($('#addCategory')) $('#addCategory').addEventListener('click',async()=>{
+    await api('categories',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name:$('#newCategory').value})});
+    $('#newCategory').value='';await loadBootstrap();
+  });
+  if($('#addRule')) $('#addRule').addEventListener('click',async()=>{
+    await api('vendor-rules',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({vendor_pattern:$('#ruleVendor').value,category_id:Number($('#ruleCategory').value)})});
+    $('#ruleVendor').value='';await loadBootstrap();
+  });
+  if($('#closeMonth')) $('#closeMonth').addEventListener('click',async()=>{
+    try{
+      const r=await api('close-month',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({month:currentMonth()})});
+      $('#closeStatus').innerHTML='<p class="ok">'+esc(r.month)+' closed successfully.</p>';
+    }catch(e){
+      const b=e.data&&e.data.blockers;
+      $('#closeStatus').innerHTML=b?'<p class="warn">Cannot close: '+b.uncategorized+' uncategorized, '+b.missing_receipts+' missing receipts, '+b.unreviewed+' unreviewed, '+(b.unmatched_receipts||0)+' unmatched receipts.</p>':'<p class="warn">'+esc(e.message)+'</p>';
+    }
+  });
+
+  if($('#exportCsv')) $('#exportCsv').addEventListener('click',()=>{
+    const head=['Date','Vendor','Amount','Category','Payment Method','Payment Reference','Receipt','Reviewed'];
+    const rows=transactions.map((t)=>[t.transaction_date,t.vendor_normalized||t.vendor_raw,t.amount,t.category_name||'',t.payment_method||'credit_card',t.payment_reference||'',t.receipt_id?'Yes':'No',t.captain_reviewed?'Yes':'No']);
+    const csv=[head,...rows].map((r)=>r.map((v)=>'"'+String(v??'').replaceAll('"','""')+'"').join(',')).join('\n');
+    const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));a.download='carbon-copy-'+currentMonth()+'.csv';a.click();
+  });
+
+  if($('#runReport')) $('#runReport').addEventListener('click',async()=>{
+    const scope=$('#reportScope').value,year=Number($('#reportYear').value)||new Date().getFullYear(),m=Number($('#reportMonth').value)||new Date().getMonth()+1,q=Number($('#reportQuarter').value)||Math.floor(new Date().getMonth()/3)+1;
+    const r=await api('report?scope='+scope+'&year='+year+'&month='+m+'&quarter='+q);
+    const categories=(r.byCategory||[]).map((x)=>'<div class="barrow"><span>'+esc(x.name)+'</span><span></span><b>'+money(x.total)+'</b></div>').join('');
+    const payments=(r.byPaymentMethod||[]).map((x)=>'<div class="barrow"><span>'+esc(String(x.name||'').replace('_',' '))+'</span><span></span><b>'+money(x.total)+'</b></div>').join('');
+    const vendors=(r.topVendors||[]).map((x)=>'<div class="barrow"><span>'+esc(x.name)+'</span><span></span><b>'+money(x.total)+'</b></div>').join('');
+    $('#reportOutput').innerHTML='<h2>'+esc(r.label)+'</h2><p><b>Total:</b> '+money(r.summary.total)+' · <b>Transactions:</b> '+r.summary.transaction_count+'</p><div class="grid2"><div><h3>By Category</h3>'+categories+'</div><div><h3>By Payment Method</h3>'+payments+'</div></div><h3>Top Vendors</h3>'+vendors;
+  });
+}
+
+async function boot(){
+  wireNavigation();
+  wireStaticControls();
+  try{
+    await loadBootstrap();
+    await Promise.all([loadDashboard(),loadTransactions(),loadReceiptInbox()]);
+  }catch(e){
+    console.error(e);
+    toast('Some data could not load, but navigation is available.');
+  }
+}
+
+boot();
++Number(d.parsed.amount||0).toFixed(2);
+  });
+
   await test('Reports API',async()=>{
     const m=currentMonth().split('-');
     const d=await api('report?scope=month&year='+encodeURIComponent(m[0])+'&month='+encodeURIComponent(Number(m[1])));
