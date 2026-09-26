@@ -221,7 +221,53 @@ async function loadReceiptInbox(){
 }
 function renderRules(){
   const cats=$('#categoryList');
-  if(cats) cats.innerHTML=(bootstrap.categories||[]).map((c)=>'<div class="category-item">'+esc(c.name)+'</div>').join('');
+  if(cats){
+    cats.innerHTML=(bootstrap.categories||[]).map((c)=>
+      '<div class="category-item category-manage"><span>'+esc(c.name)+'</span><div class="row">'+
+      '<button class="edit-category" data-id="'+c.id+'" type="button">Edit</button>'+
+      '<button class="delete-category" data-id="'+c.id+'" type="button">Delete</button>'+
+      '</div></div>'
+    ).join('');
+    $('.edit-category').forEach((btn)=>btn.addEventListener('click',async()=>{
+      const c=(bootstrap.categories||[]).find((x)=>String(x.id)===String(btn.dataset.id));if(!c)return;
+      const name=window.prompt('Rename category:',c.name);
+      if(name===null||!name.trim()||name.trim()===c.name)return;
+      try{
+        await api('categories/'+c.id,{method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify({name:name.trim()})});
+        await loadBootstrap();
+        await Promise.all([loadTransactions(),loadDashboard(),loadReceiptInbox()]);
+        toast('Category renamed');
+      }catch(e){toast(e.message)}
+    }));
+    $('.delete-category').forEach((btn)=>btn.addEventListener('click',async()=>{
+      const c=(bootstrap.categories||[]).find((x)=>String(x.id)===String(btn.dataset.id));if(!c)return;
+      if(!window.confirm('Delete '+c.name+'?'))return;
+      try{
+        await api('categories/'+c.id,{method:'DELETE',headers:{'content-type':'application/json'},body:'{}'});
+        await loadBootstrap();
+        await Promise.all([loadTransactions(),loadDashboard(),loadReceiptInbox()]);
+        toast('Category deleted');
+      }catch(e){
+        if(e.status!==409||!e.data?.usage){toast(e.message);return}
+        const choices=(bootstrap.categories||[]).filter((x)=>String(x.id)!==String(c.id));
+        const numbered=choices.map((x,i)=>(i+1)+'. '+x.name).join('\n');
+        const u=e.data.usage;
+        const pick=window.prompt(
+          c.name+' is in use by '+u.transactions+' transaction(s), '+u.receipts+' receipt(s), and '+u.vendor_rules+' vendor rule(s).\n\nChoose the category to move them to before deleting '+c.name+':\n'+numbered+'\n\nEnter a number:'
+        );
+        const n=Number(pick);
+        if(!Number.isInteger(n)||n<1||n>choices.length)return;
+        const target=choices[n-1];
+        if(!window.confirm('Move everything from '+c.name+' to '+target.name+' and delete '+c.name+'?'))return;
+        try{
+          await api('categories/'+c.id,{method:'DELETE',headers:{'content-type':'application/json'},body:JSON.stringify({replacement_category_id:target.id})});
+          await loadBootstrap();
+          await Promise.all([loadTransactions(),loadDashboard(),loadReceiptInbox()]);
+          toast('Category merged and deleted');
+        }catch(err){toast(err.message)}
+      }
+    }));
+  }
   const rules=$('#ruleList');
   if(rules) rules.innerHTML=(bootstrap.rules||[]).length?(bootstrap.rules||[]).map((r)=>'<div class="rule-item"><b>'+esc(r.vendor_pattern)+'</b> → '+esc(r.category_name)+'</div>').join(''):'<p class="muted">No vendor rules yet.</p>';
   const sel=$('#ruleCategory');
