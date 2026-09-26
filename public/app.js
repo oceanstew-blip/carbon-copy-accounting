@@ -149,6 +149,44 @@ function renderRules(){
   if(sel) sel.innerHTML=(bootstrap.categories||[]).map((c)=>'<option value="'+c.id+'">'+esc(c.name)+'</option>').join('');
 }
 
+
+async function runReceiptOcr(file){
+  const status=$('#ocrStatus');
+  if(!file||!status)return;
+  status.className='muted';
+  status.textContent='Reading receipt image…';
+  if(file.type==='application/pdf'||/\.pdf$/i.test(file.name||'')){
+    status.textContent='PDF attached. OCR is not enabled for PDFs yet; enter the fields manually.';
+    return;
+  }
+  const fd=new FormData();fd.append('file',file);
+  try{
+    const r=await api('ocr',{method:'POST',body:fd});
+    if(r.receipt_date&&!$('#rDate').value)$('#rDate').value=r.receipt_date;
+    if(r.vendor&&!$('#rVendor').value)$('#rVendor').value=r.vendor;
+    if(r.amount!=null&&!$('#rAmount').value)$('#rAmount').value=Number(r.amount).toFixed(2);
+    if(r.receipt_text&&!$('#rText').value)$('#rText').value=r.receipt_text;
+    if(r.suggested_category&&!$('#rCategory').value){
+      const cat=(bootstrap.categories||[]).find((c)=>c.name===r.suggested_category);
+      if(cat)$('#rCategory').value=String(cat.id);
+    }
+    const found=[
+      r.vendor?'vendor':'',
+      r.receipt_date?'date':'',
+      r.amount!=null?'amount':'',
+      r.suggested_category?'category':''
+    ].filter(Boolean);
+    status.className=found.length?'ok':'warn';
+    status.textContent=found.length
+      ? 'Receipt read ('+(Number(r.confidence)||0)+'% OCR confidence). Review the prefilled fields before saving.'
+      : 'OCR finished but could not confidently identify the key fields. Enter them manually.';
+  }catch(e){
+    console.error(e);
+    status.className='warn';
+    status.textContent='Could not read this image automatically. You can still enter the fields manually and save it.';
+  }
+}
+
 function renderReceiptForm(){
   const sel=$('#rCategory'); if(!sel) return;
   sel.innerHTML='<option value="">Choose category</option>'+(bootstrap.categories||[]).map((c)=>'<option value="'+c.id+'">'+esc(c.name)+'</option>').join('');
@@ -242,6 +280,13 @@ async function runSystemCheck(){
     return d.rows.length+' waiting receipt(s)';
   });
 
+  await test('OCR service',async()=>{
+    const d=await api('ocr/status');
+    if(!d.enabled) throw new Error('OCR disabled');
+    if(!d.manual_fallback) throw new Error('Manual fallback missing');
+    return 'Server-side OCR ready · manual fallback available';
+  });
+
   await test('Reports API',async()=>{
     const m=currentMonth().split('-');
     const d=await api('report?scope=month&year='+encodeURIComponent(m[0])+'&month='+encodeURIComponent(Number(m[1])));
@@ -279,6 +324,10 @@ async function runSystemCheck(){
 }
 
 function wireStaticControls(){
+  if($('#rFile')) $('#rFile').addEventListener('change',()=>{
+    const f=$('#rFile').files&&$('#rFile').files[0];
+    if(f) runReceiptOcr(f).catch(console.error);
+  });
   const monthEl=$('#month');
   if(monthEl){monthEl.value=new Date().toISOString().slice(0,7);monthEl.addEventListener('change',()=>Promise.all([loadDashboard(),loadTransactions()]));}
   if($('#refresh')) $('#refresh').addEventListener('click',()=>Promise.all([loadDashboard(),loadTransactions(),loadReceiptInbox()]));
