@@ -2,6 +2,7 @@ import express from "express";
 import multer from "multer";
 import pg from "pg";
 import crypto from "crypto";
+import { capitalOneCsv, initialRules, driveReceipts } from "./seed.js";
 
 const {Pool}=pg;
 const app=express();
@@ -54,6 +55,7 @@ async function init(){
     ALTER TABLE receipts ADD COLUMN IF NOT EXISTS category_id BIGINT REFERENCES categories(id) ON DELETE SET NULL;
     ALTER TABLE receipts ADD COLUMN IF NOT EXISTS file_sha256 TEXT;
     ALTER TABLE receipts ADD COLUMN IF NOT EXISTS source_url TEXT;
+    ALTER TABLE receipts ALTER COLUMN file_data DROP NOT NULL;
     CREATE UNIQUE INDEX IF NOT EXISTS receipts_sha_idx ON receipts(file_sha256) WHERE file_sha256 IS NOT NULL;
     CREATE TABLE IF NOT EXISTS vendor_rules(
       id BIGSERIAL PRIMARY KEY,vendor_pattern TEXT NOT NULL UNIQUE,category_id BIGINT NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
@@ -64,6 +66,39 @@ async function init(){
   await pool.query("INSERT INTO cards(label,last4) VALUES($1,$2) ON CONFLICT(last4) DO NOTHING",["Capital One","0945"]);
   const cats=["Fuel & Lubricants","Dockage / Marina","Repairs & Maintenance","Provisions","Supplies","Insurance","Communications / Internet","Crew Travel","Crew Meals","Training / Certifications","Safety Equipment","Tender / Toys","Professional Services","Shipping / Freight","Customs / Port Fees","Guest Expenses","Transportation","Capital Improvements","Owner / Personal","Miscellaneous"];
   for(let i=0;i<cats.length;i++)await pool.query("INSERT INTO categories(name,sort_order) VALUES($1,$2) ON CONFLICT(name) DO NOTHING",[cats[i],(i+1)*10]);
+  await seedInitialData();
+}
+function parseCsvLine(line){
+  const out=[];let cur="",q=false;
+  for(let i=0;i<line.length;i++){const ch=line[i];if(ch==='"'){if(q&&line[i+1]==='"'){cur+='"';i++}else q=!q}else if(ch===','&&!q){out.push(cur);cur=""}else cur+=ch}
+  out.push(cur);return out;
+}
+function csvDate(v){const d=new Date(v);return !isNaN(d)?d.toISOString().slice(0,10):null}
+async function seedInitialData(){
+  for(const [pattern,category] of initialRules){
+    const c=(await pool.query("SELECT id FROM categories WHERE name=$1",[category])).rows[0];
+    if(c)await pool.query(`INSERT INTO vendor_rules(vendor_pattern,category_id) VALUES($1,$2)
+      ON CONFLICT(vendor_pattern) DO UPDATE SET category_id=EXCLUDED.category_id,approved=true`,[pattern,c.id]);
+  }
+  const lines=capitalOneCsv.replace(/\r/g,"").split("\n").filter(Boolean),headers=parseCsvLine(lines[0]).map(x=>x.toLowerCase().replace(/\./g,"").trim());
+  const ix=n=>headers.findIndex(h=>h===n),card=(await pool.query("SELECT id FROM cards WHERE last4='0945' LIMIT 1")).rows[0];
+  for(const line of lines.slice(1)){
+    const c=parseCsvLine(line),debit=Number(c[ix("debit")]||NaN),credit=Number(c[ix("credit")]||NaN);
+    const amount=Number.isFinite(debit)&&debit!==0?Math.abs(debit):Number.isFinite(credit)&&credit!==0?-Math.abs(credit):null;
+    const row={transaction_date:csvDate(c[ix("transaction date")]),posted_date:csvDate(c[ix("posted date")]),vendor_raw:c[ix("description")]||"",amount,card_last4:String(c[ix("card no")]||"945").padStart(4,"0")};
+    if(!row.transaction_date||!row.vendor_raw||row.amount===null)continue;
+    const ext=fingerprint(row),rule=(await pool.query("SELECT category_id FROM vendor_rules WHERE $1 ILIKE '%'||vendor_pattern||'%' ORDER BY length(vendor_pattern) DESC LIMIT 1",[row.vendor_raw])).rows[0];
+    await pool.query(`INSERT INTO transactions(transaction_date,posted_date,vendor_raw,vendor_normalized,amount,category_id,card_id,source,external_id,status)
+      VALUES($1,$2,$3,$3,$4,$5,$6,'capital-one-csv',$7,'posted') ON CONFLICT(external_id) DO NOTHING`,
+      [row.transaction_date,row.posted_date,row.vendor_raw,row.amount,rule?.category_id||null,card?.id||null,ext]);
+  }
+  for(const r of driveReceipts){
+    const c=(await pool.query("SELECT id FROM categories WHERE name=$1",[r.category])).rows[0];
+    const existing=(await pool.query("SELECT id FROM receipts WHERE source_url=$1",[r.url])).rows[0];if(existing)continue;
+    const q=await pool.query(`INSERT INTO receipts(transaction_id,file_name,content_type,file_size,file_data,receipt_date,vendor,amount,category_id,file_sha256,source_url)
+      VALUES(NULL,$1,'application/pdf',0,NULL,$2,$3,$4,$5,NULL,$6) RETURNING id`,[r.file_name,r.date,r.vendor,r.amount,c?.id||null,r.url]);
+    await autoMatchReceipt(q.rows[0].id);
+  }
 }
 async function autoMatchReceipt(receiptId){
   const r=(await pool.query("SELECT * FROM receipts WHERE id=$1",[receiptId])).rows[0];
