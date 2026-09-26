@@ -90,7 +90,7 @@ function suggestedCategoryFromText(text){
   if(/\b(dock|dockage|marina|slip|berth|yacht club|storage)\b/i.test(t))return "Dockage / Marina";
   if(/\b(customs|dtops|decal|port fee|entry fee)\b/i.test(t))return "Customs / Port Fees";
   if(/\b(office|paper|printer|ink|staples|notebook)\b/i.test(t))return "Supplies";
-  if(/\b(weather|routing|forecast|buoyweather|weatherbell)\b/i.test(t))return "Navigation / Weather";
+  if(/\b(weather|routing|forecast|buoyweather|weatherbell)\b/i.test(t))return "Navigation Bridge";
   if(/\b(uber|lyft|taxi|rideshare)\b/i.test(t))return "Transportation";
   if(/\b(fuel|diesel|gasoline|gas station|racetrac|wawa|lubricant|oil)\b/i.test(t))return "Fuel & Lubricants";
   return null;
@@ -524,6 +524,60 @@ app.post("/api/categories",async(req,res,next)=>{try{
   const q=await pool.query("INSERT INTO categories(name,sort_order) VALUES($1,999) ON CONFLICT(name) DO UPDATE SET active=true RETURNING id,name,sort_order",[name]);
   res.status(201).json(q.rows[0])
 }catch(e){next(e)}});
+
+app.patch("/api/categories/:id",async(req,res,next)=>{try{
+  const id=Number(req.params.id),name=String(req.body.name||"").trim();
+  if(!Number.isFinite(id)||!name)return res.status(400).json({error:"Category and name required"});
+  const exists=(await pool.query("SELECT id FROM categories WHERE id=$1 AND active=true",[id])).rows[0];
+  if(!exists)return res.status(404).json({error:"Category not found"});
+  const dup=(await pool.query("SELECT id FROM categories WHERE lower(name)=lower($1) AND id<>$2",[name,id])).rows[0];
+  if(dup)return res.status(409).json({error:"A category with that name already exists"});
+  const q=await pool.query("UPDATE categories SET name=$1 WHERE id=$2 RETURNING id,name,sort_order",[name,id]);
+  res.json(q.rows[0]);
+}catch(e){next(e)}});
+
+app.delete("/api/categories/:id",async(req,res,next)=>{try{
+  const id=Number(req.params.id),replacement=Number(req.body?.replacement_category_id);
+  if(!Number.isFinite(id))return res.status(400).json({error:"Invalid category"});
+  const current=(await pool.query("SELECT id,name FROM categories WHERE id=$1 AND active=true",[id])).rows[0];
+  if(!current)return res.status(404).json({error:"Category not found"});
+
+  const [tx,rc,vr]=await Promise.all([
+    pool.query("SELECT COUNT(*)::int count FROM transactions WHERE category_id=$1",[id]),
+    pool.query("SELECT COUNT(*)::int count FROM receipts WHERE category_id=$1",[id]),
+    pool.query("SELECT COUNT(*)::int count FROM vendor_rules WHERE category_id=$1",[id])
+  ]);
+  const usage={
+    transactions:tx.rows[0].count,
+    receipts:rc.rows[0].count,
+    vendor_rules:vr.rows[0].count
+  };
+  const total=usage.transactions+usage.receipts+usage.vendor_rules;
+
+  if(total>0&&!Number.isFinite(replacement)){
+    return res.status(409).json({error:"Category is in use",usage});
+  }
+  if(Number.isFinite(replacement)){
+    if(replacement===id)return res.status(400).json({error:"Choose a different replacement category"});
+    const target=(await pool.query("SELECT id,name FROM categories WHERE id=$1 AND active=true",[replacement])).rows[0];
+    if(!target)return res.status(400).json({error:"Replacement category not found"});
+    const client=await pool.connect();
+    try{
+      await client.query("BEGIN");
+      await client.query("UPDATE transactions SET category_id=$1 WHERE category_id=$2",[replacement,id]);
+      await client.query("UPDATE receipts SET category_id=$1 WHERE category_id=$2",[replacement,id]);
+      await client.query("UPDATE vendor_rules SET category_id=$1 WHERE category_id=$2",[replacement,id]);
+      await client.query("UPDATE categories SET active=false WHERE id=$1",[id]);
+      await client.query("COMMIT");
+    }catch(e){await client.query("ROLLBACK");throw e}
+    finally{client.release()}
+    return res.json({ok:true,deleted_id:id,reassigned_to:replacement,usage});
+  }
+
+  await pool.query("UPDATE categories SET active=false WHERE id=$1",[id]);
+  res.json({ok:true,deleted_id:id,usage});
+}catch(e){next(e)}});
+
 
 app.post("/api/vendor-rules",async(req,res,next)=>{try{
   const vendor=String(req.body.vendor_pattern||"").trim(),cid=Number(req.body.category_id);
