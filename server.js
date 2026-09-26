@@ -632,6 +632,18 @@ app.post("/api/receipts",upload.any(),async(req,res,next)=>{try{
   res.status(201).json({...q.rows[0],matched_transaction_id:matched,created_transaction_id:Number.isFinite(tid)?tid:null,payment_method:paymentMethod})
 }catch(e){next(e)}});
 
+app.post("/api/receipts/:id/ocr",async(req,res,next)=>{try{
+  const id=Number(req.params.id);
+  if(!Number.isFinite(id))return res.status(400).json({error:"Invalid receipt id"});
+  const r=(await pool.query("SELECT file_name,content_type,file_data,purged_at FROM receipts WHERE id=$1",[id])).rows[0];
+  if(!r)return res.status(404).json({error:"Receipt not found"});
+  if(r.purged_at||!r.file_data)return res.status(410).json({error:"Receipt image is no longer available"});
+  if(r.content_type==="application/pdf")return res.status(422).json({error:"PDF re-reading is not enabled yet"});
+  if(!String(r.content_type||"").startsWith("image/")&&!/heic|heif|octet-stream/i.test(String(r.content_type||"")))return res.status(415).json({error:"This receipt type cannot be re-read automatically"});
+  const out=await ocrImage(r.file_data);
+  res.json(out);
+}catch(e){next(e)}});
+
 app.patch("/api/receipts/:id",async(req,res,next)=>{try{
   const id=Number(req.params.id),b=req.body;
   if(!Number.isFinite(id))return res.status(400).json({error:"Invalid receipt id"});
