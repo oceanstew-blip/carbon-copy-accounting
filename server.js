@@ -153,36 +153,68 @@ function mergeOcrFields(full,top,bottom,confidence){
   merged.review_reasons=reasons;
   return merged;
 }
+function chooseBestAmount(parsedList){
+  const candidates=parsedList.filter((p)=>p&&p.amount!==null&&p.amount!==undefined);
+  if(!candidates.length)return null;
+  const verified=candidates.filter((p)=>p.total_verified);
+  if(verified.length){
+    const counts=new Map();
+    verified.forEach((p)=>counts.set(Number(p.amount).toFixed(2),(counts.get(Number(p.amount).toFixed(2))||0)+1));
+    return Number([...counts.entries()].sort((a,b)=>b[1]-a[1])[0][0]);
+  }
+  const counts=new Map();
+  candidates.forEach((p)=>counts.set(Number(p.amount).toFixed(2),(counts.get(Number(p.amount).toFixed(2))||0)+1));
+  const ranked=[...counts.entries()].sort((a,b)=>b[1]-a[1]);
+  if(ranked[0]&&ranked[0][1]>=2)return Number(ranked[0][0]);
+  return Number(candidates[0].amount);
+}
+
 async function ocrImage(buffer){
   const base=await sharp(buffer,{failOn:"none"})
     .rotate()
-    .resize({width:2400,height:3200,fit:"inside",withoutEnlargement:true})
+    .resize({width:2600,height:3600,fit:"inside",withoutEnlargement:true})
     .grayscale()
     .normalize()
     .sharpen()
-    .extend({top:30,bottom:30,left:30,right:30,background:"white"})
+    .extend({top:40,bottom:40,left:40,right:40,background:"white"})
     .png()
     .toBuffer();
 
   const meta=await sharp(base).metadata();
   const width=meta.width,height=meta.height;
   const topHeight=Math.max(1,Math.round(height*0.34));
-  const bottomTop=Math.max(0,Math.round(height*0.45));
+  const bottomTop=Math.max(0,Math.round(height*0.42));
   const bottomHeight=Math.max(1,height-bottomTop);
+
   const topCrop=await sharp(base).extract({left:0,top:0,width,height:topHeight}).png().toBuffer();
-  const bottomCrop=await sharp(base).extract({left:0,top:bottomTop,width,height:bottomHeight}).threshold(180).png().toBuffer();
+  const bottomGray=await sharp(base).extract({left:0,top:bottomTop,width,height:bottomHeight}).png().toBuffer();
+  const bottomT160=await sharp(bottomGray).threshold(160).png().toBuffer();
+  const bottomT200=await sharp(bottomGray).threshold(200).png().toBuffer();
 
   const worker=await getOcrWorker();
   await worker.setParameters({tessedit_pageseg_mode:PSM.SINGLE_BLOCK,preserve_interword_spaces:"1"});
   const fullResult=await worker.recognize(base);
   const topResult=await worker.recognize(topCrop);
-  const bottomResult=await worker.recognize(bottomCrop);
-  await worker.setParameters({tessedit_pageseg_mode:PSM.SINGLE_BLOCK,preserve_interword_spaces:"1"});
+  const bottomGrayResult=await worker.recognize(bottomGray);
+  const bottom160Result=await worker.recognize(bottomT160);
+  const bottom200Result=await worker.recognize(bottomT200);
 
   const full=parseOcrReceipt(fullResult?.data?.text||"");
   const top=parseOcrReceipt(topResult?.data?.text||"");
-  const bottom=parseOcrReceipt(bottomResult?.data?.text||"");
-  return mergeOcrFields(full,top,bottom,fullResult?.data?.confidence);
+  const b1=parseOcrReceipt(bottomGrayResult?.data?.text||"");
+  const b2=parseOcrReceipt(bottom160Result?.data?.text||"");
+  const b3=parseOcrReceipt(bottom200Result?.data?.text||"");
+  const amount=chooseBestAmount([b1,b2,b3,full]);
+
+  const merged=mergeOcrFields(full,top,b1,fullResult?.data?.confidence);
+  merged.amount=amount;
+  merged.total_verified=[b1,b2,b3,full].some((p)=>p.total_verified&&p.amount!==null&&amount!==null&&Math.abs(Number(p.amount)-Number(amount))<0.01);
+  const combinedBottomText=[b1.receipt_text,b2.receipt_text,b3.receipt_text].filter(Boolean).join("\n");
+  merged.detected_payment_method=detectPaymentMethodFromText(combinedBottomText)||merged.detected_payment_method;
+  if(merged.amount===null&&!merged.review_reasons.includes("total"))merged.review_reasons.push("total");
+  if(merged.amount!==null)merged.review_reasons=merged.review_reasons.filter((x)=>x!=="total");
+  merged.field_score=[merged.vendor,merged.receipt_date,merged.amount!==null,merged.detected_payment_method,merged.suggested_category].filter(Boolean).length;
+  return merged;
 }
 async function combineReceiptImages(files){
   if(!files?.length)throw new Error("No receipt images");
@@ -630,6 +662,33 @@ app.post("/api/close-month",async(req,res,next)=>{try{
 app.use((err,_req,res,_next)=>{console.error(err);if(err.code==="LIMIT_FILE_SIZE")return res.status(413).json({error:"Receipt must be under 20MB per image"});if(err.statusCode)return res.status(err.statusCode).json({error:err.message});res.status(500).json({error:"Server error"})});
 
 await init();
+const ONE_TIME_RECEIPT_REPAIR=await pool.connect();
+try{
+  await ONE_TIME_RECEIPT_REPAIR.query("BEGIN");
+  await ONE_TIME_RECEIPT_REPAIR.query("UPDATE receipts SET payment_method='credit_card' WHERE id IN (6,7,11) AND transaction_id IS NULL");
+
+  const r16=(await ONE_TIME_RECEIPT_REPAIR.query("SELECT * FROM receipts WHERE id=16 FOR UPDATE")).rows[0];
+  if(r16 && !r16.transaction_id && r16.payment_method==='cash' && r16.receipt_date && r16.vendor && r16.amount!==null){
+    let categoryId=r16.category_id||null;
+    if(!categoryId && /restaurant|grill|cafe|food|meal|taco|tea|coffee/i.test((r16.vendor||"")+"\n"+(r16.receipt_text||""))){
+      categoryId=(await ONE_TIME_RECEIPT_REPAIR.query("SELECT id FROM categories WHERE name='Provisions' LIMIT 1")).rows[0]?.id||null;
+    }
+    const tr=await ONE_TIME_RECEIPT_REPAIR.query(`INSERT INTO transactions(transaction_date,posted_date,vendor_raw,vendor_normalized,amount,category_id,card_id,source,external_id,status,payment_method,payment_reference,captain_reviewed)
+      VALUES($1,$1,$2,$2,$3,$4,NULL,'receipt-correction','receipt-repair-16','posted','cash',$5,$6)
+      ON CONFLICT(external_id) WHERE external_id IS NOT NULL DO NOTHING RETURNING id`,[
+        r16.receipt_date,r16.vendor,Number(r16.amount),categoryId,r16.payment_reference||null,Boolean(categoryId)
+      ]);
+    const tid=tr.rows[0]?.id||((await ONE_TIME_RECEIPT_REPAIR.query("SELECT id FROM transactions WHERE external_id='receipt-repair-16' LIMIT 1")).rows[0]?.id||null);
+    if(tid)await ONE_TIME_RECEIPT_REPAIR.query("UPDATE receipts SET transaction_id=$1,category_id=COALESCE(category_id,$2),review_required=false WHERE id=16",[tid,categoryId]);
+  }
+  await ONE_TIME_RECEIPT_REPAIR.query("COMMIT");
+  console.log("ONE_TIME_RECEIPT_REPAIR complete");
+}catch(e){
+  await ONE_TIME_RECEIPT_REPAIR.query("ROLLBACK");
+  console.error("ONE_TIME_RECEIPT_REPAIR failed",e);
+}finally{
+  ONE_TIME_RECEIPT_REPAIR.release();
+}
 
 
 
