@@ -224,6 +224,25 @@ app.get("/health",(_req,res)=>res.json({ok:true}));
 
 app.get("/api/ocr/status",(_req,res)=>res.json({enabled:true,mode:"server-side",engine:"tesseract",formats:["JPG","PNG","WEBP","HEIC","HEIF"],manual_fallback:true}));
 
+app.get("/api/ocr/self-test",async(_req,res,next)=>{try{
+  const svg=Buffer.from(`<svg width="1200" height="700" xmlns="http://www.w3.org/2000/svg">
+    <rect width="100%" height="100%" fill="white"/>
+    <text x="80" y="130" font-family="Arial" font-size="58" fill="black">HARBOR MARINE SUPPLY</text>
+    <text x="80" y="240" font-family="Arial" font-size="48" fill="black">09/26/2026</text>
+    <text x="80" y="350" font-family="Arial" font-size="42" fill="black">Bilge pump hose and stainless clamps</text>
+    <text x="80" y="470" font-family="Arial" font-size="54" fill="black">TOTAL $87.46</text>
+  </svg>`);
+  const png=await sharp(svg).png().toBuffer();
+  const data=await ocrImage(png);
+  const vendorOk=/HARBOR|MARINE|SUPPLY/i.test(data.vendor||data.receipt_text||"");
+  const amountOk=Math.abs(Number(data.amount)-87.46)<0.02;
+  const dateOk=data.receipt_date==="2026-09-26";
+  const categoryOk=data.suggested_category==="Repairs & Maintenance";
+  const ok=vendorOk&&amountOk&&dateOk&&categoryOk;
+  res.status(ok?200:503).json({ok,vendor_ok:vendorOk,amount_ok:amountOk,date_ok:dateOk,category_ok:categoryOk,confidence:data.confidence,parsed:{vendor:data.vendor,receipt_date:data.receipt_date,amount:data.amount,suggested_category:data.suggested_category}});
+}catch(e){next(e)}});
+
+
 app.post("/api/ocr",upload.single("file"),async(req,res,next)=>{try{
   const f=req.file;if(!f)return res.status(400).json({error:"Receipt image required"});
   if(f.mimetype==="application/pdf")return res.status(422).json({error:"PDF OCR is not enabled yet. You can still enter the receipt fields manually."});
