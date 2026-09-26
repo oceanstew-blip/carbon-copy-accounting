@@ -59,6 +59,14 @@ function amountFromLine(line){
     .map((m)=>Number(m[1].replace(/,/g,""))).filter(Number.isFinite);
   return vals.length?vals[vals.length-1]:null;
 }
+function detectPaymentMethodFromText(text){
+  const t=String(text||"").toLowerCase();
+  if(/\b(payment|tender(?:ed)?|paid)\s*:?\s*cash\b|\bcash\s+(tendered|payment)\b/i.test(t))return "cash";
+  if(/\b(payment|paid)\s*:?\s*check\b|\bcheck\s*#?/i.test(t))return "check";
+  if(/\b(payment|paid)\s*:?\s*wire\b|\bwire\s+(transfer|payment)\b/i.test(t))return "wire";
+  if(/\b(visa|mastercard|amex|american express|discover|credit card|card ending|card #)\b/i.test(t))return "credit_card";
+  return null;
+}
 function suggestedCategoryFromText(text){
   const t=String(text||"").toLowerCase();
   if(/\b(diver|diving|bottom clean|underwater|zinc|hubbell|plug|cable|pump|hose|clamp|sealant|hardware|acetone|mineral spirits|handrail|gate|repair|maintenance|part|parts|engine room)\b/i.test(t))return "Repairs & Maintenance";
@@ -73,18 +81,24 @@ function suggestedCategoryFromText(text){
   return null;
 }
 function labeledAmount(lines,re){
-  const matches=lines.filter((line)=>re.test(line));
-  for(let i=matches.length-1;i>=0;i--){const a=amountFromLine(matches[i]);if(a!==null)return a}
+  for(let i=lines.length-1;i>=0;i--){
+    if(!re.test(lines[i]))continue;
+    const same=amountFromLine(lines[i]);
+    if(same!==null)return same;
+    for(let step=1;step<=2;step++){
+      const next=lines[i+step];
+      if(!next)break;
+      if(/subtotal|cash tendered|tendered|change|tip|gratuity/i.test(next))break;
+      const a=amountFromLine(next);
+      if(a!==null)return a;
+    }
+  }
   return null;
 }
 function parseOcrReceipt(text){
   const lines=String(text||"").split(/\r?\n/).map((x)=>x.replace(/\s+/g," ").trim()).filter(Boolean);
-  const paymentText=lines.join(" ").toLowerCase();
-  let detected_payment_method=null;
-  if(/\b(payment|tender(?:ed)?|paid)\s*:?\s*cash\b|\bcash\s+(tendered|payment)\b/i.test(paymentText)) detected_payment_method="cash";
-  else if(/\b(payment|paid)\s*:?\s*check\b|\bcheck\s*#?/i.test(paymentText)) detected_payment_method="check";
-  else if(/\b(payment|paid)\s*:?\s*wire\b|\bwire\s+(transfer|payment)\b/i.test(paymentText)) detected_payment_method="wire";
-  else if(/\b(visa|mastercard|amex|american express|discover|credit card|card ending|card #)\b/i.test(paymentText)) detected_payment_method="credit_card";
+  const paymentText=lines.join(" ");
+  const detected_payment_method=detectPaymentMethodFromText(paymentText);
 
   let amount=labeledAmount(lines,/^(?:grand\s+total|total|amount\s+due|balance\s+due)\b/i);
   if(amount===null)amount=labeledAmount(lines,/\b(grand\s+total|amount\s+due|balance\s+due|total)\b/i);
@@ -159,13 +173,11 @@ async function ocrImage(buffer){
   const bottomCrop=await sharp(base).extract({left:0,top:bottomTop,width,height:bottomHeight}).threshold(180).png().toBuffer();
 
   const worker=await getOcrWorker();
-  await worker.setParameters({tessedit_pageseg_mode:PSM.AUTO,preserve_interword_spaces:"1"});
-  const fullResult=await worker.recognize(base);
   await worker.setParameters({tessedit_pageseg_mode:PSM.SINGLE_BLOCK,preserve_interword_spaces:"1"});
+  const fullResult=await worker.recognize(base);
   const topResult=await worker.recognize(topCrop);
-  await worker.setParameters({tessedit_pageseg_mode:PSM.SPARSE_TEXT,preserve_interword_spaces:"1"});
   const bottomResult=await worker.recognize(bottomCrop);
-  await worker.setParameters({tessedit_pageseg_mode:PSM.AUTO,preserve_interword_spaces:"1"});
+  await worker.setParameters({tessedit_pageseg_mode:PSM.SINGLE_BLOCK,preserve_interword_spaces:"1"});
 
   const full=parseOcrReceipt(fullResult?.data?.text||"");
   const top=parseOcrReceipt(topResult?.data?.text||"");
@@ -491,7 +503,9 @@ app.post("/api/receipts",upload.any(),async(req,res,next)=>{try{
   const sha=crypto.createHash("sha256").update(f.buffer).digest("hex");
   let tid=req.body.transaction_id?Number(req.body.transaction_id):null;
   const date=req.body.receipt_date||null,vendor=String(req.body.vendor||"").trim()||null,amount=moneyNum(req.body.amount),cat=req.body.category_id?Number(req.body.category_id):null,receiptText=String(req.body.receipt_text||"").trim()||null;
-  const paymentMethod=["credit_card","wire","check","cash"].includes(req.body.payment_method)?req.body.payment_method:null;
+  const submittedPayment=["credit_card","wire","check","cash"].includes(req.body.payment_method)?req.body.payment_method:null;
+  const receiptDetectedPayment=detectPaymentMethodFromText(receiptText);
+  const paymentMethod=(receiptDetectedPayment&&receiptDetectedPayment!=="credit_card")?receiptDetectedPayment:submittedPayment;
   if(!paymentMethod)return res.status(400).json({error:"Confirm the payment method before saving this receipt"});
   const paymentReference=String(req.body.payment_reference||"").trim()||null;
   const existing=(await pool.query("SELECT * FROM receipts WHERE file_sha256=$1",[sha])).rows[0];
