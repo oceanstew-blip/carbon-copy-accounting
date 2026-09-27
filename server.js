@@ -5,6 +5,9 @@ import crypto from "crypto";
 import sharp from "sharp";
 import { promises as fsp } from "fs";
 import { createWorker, PSM } from "tesseract.js";
+import { AwsClient } from "aws4fetch";
+import nodemailer from "nodemailer";
+import zlib from "zlib";
 import { capitalOneCsv, initialRules, driveReceipts } from "./seed.js";
 
 const {Pool}=pg;
@@ -1245,15 +1248,88 @@ async function legacyReceiptCleanup(){
   console.log("LEGACY_FILENAME_REFRESH complete");
 }
 
+// ponytail: email sending is a no-op (logs instead) until GMAIL_USER/
+// GMAIL_APP_PASSWORD are set — lets monitoring/backup/alert code be written
+// and wired in now without blocking on the Gmail account being ready.
+async function sendMail({to,subject,text}){
+  const user=process.env.GMAIL_USER,pass=process.env.GMAIL_APP_PASSWORD;
+  if(!user||!pass){console.log(`[mail not configured] would send to ${to}: ${subject}`);return{sent:false}}
+  const transport=nodemailer.createTransport({service:"gmail",auth:{user,pass}});
+  await transport.sendMail({from:`Carbon Copy Accounting <${user}>`,to,subject,text});
+  return{sent:true};
+}
+
+async function backupDatabase(){
+  const {rows:tables}=await pool.query(`SELECT table_name FROM information_schema.tables
+    WHERE table_schema='public' AND table_type='BASE TABLE' ORDER BY table_name`);
+  const dump={created_at:new Date().toISOString(),tables:{}};
+  for(const {table_name} of tables){
+    // table_name comes from information_schema, not user input — safe to interpolate quoted.
+    const q=await pool.query(`SELECT * FROM "${table_name}"`);
+    dump.tables[table_name]=q.rows;
+  }
+  const gz=zlib.gzipSync(Buffer.from(JSON.stringify(dump)));
+  const accessKeyId=process.env.BACKUP_S3_ACCESS_KEY_ID,secretAccessKey=process.env.BACKUP_S3_SECRET_ACCESS_KEY,
+    endpoint=process.env.BACKUP_S3_ENDPOINT,bucket=process.env.BACKUP_S3_BUCKET;
+  if(!accessKeyId||!secretAccessKey||!endpoint||!bucket){
+    console.log("BACKUP_SKIPPED: S3 credentials not configured");
+    return{uploaded:false,bytes:gz.length};
+  }
+  const client=new AwsClient({accessKeyId,secretAccessKey,region:"auto",service:"s3"});
+  const key=`carbon-copy-${new Date().toISOString().slice(0,10)}-${Date.now()}.json.gz`;
+  const url=`https://${bucket}.${new URL(endpoint).host}/${key}`;
+  const res=await client.fetch(url,{method:"PUT",body:gz,headers:{"Content-Type":"application/gzip"}});
+  if(!res.ok)throw new Error(`Backup upload failed: ${res.status} ${await res.text()}`);
+  console.log(`BACKUP_COMPLETE: ${key} (${gz.length} bytes, ${tables.length} tables)`);
+  return{uploaded:true,key,bytes:gz.length,tables:tables.length};
+}
+
+async function runMonitorCheck(){
+  const results=[];
+  const check=async(name,fn)=>{try{const detail=await fn();results.push({name,ok:true,detail})}catch(e){results.push({name,ok:false,detail:e.message})}};
+  await check("Database connection",async()=>{await pool.query("SELECT 1");return"connected"});
+  await check("Schema sanity",async()=>{
+    const c=(await pool.query("SELECT COUNT(*)::int c FROM categories WHERE active=true")).rows[0].c;
+    if(c<1)throw new Error("no active categories found");
+    return`${c} active categories`;
+  });
+  await check("OCR pipeline",async()=>{
+    const png=await fsp.readFile(new URL("./tests/fixtures/ocr-self-test-receipt.png",import.meta.url));
+    const data=await ocrImage(png);
+    if(Math.abs(Number(data.amount)-87.46)>=0.02)throw new Error(`expected $87.46, read ${data.amount}`);
+    return`read $${data.amount} correctly (${data.confidence}% confidence)`;
+  });
+  await check("No months stuck without a close decision",async()=>{
+    const {rows}=await pool.query(`SELECT COUNT(*)::int c FROM transactions WHERE status='posted'
+      AND transaction_date < date_trunc('month',NOW())-INTERVAL '2 months'
+      AND transaction_date NOT IN (SELECT month_start FROM month_closes WHERE closed=true)`);
+    return rows[0].c>0?`heads up: ${rows[0].c} transactions older than 2 months in an unclosed period`:"clean";
+  });
+  const allOk=results.every(r=>r.ok);
+  const lines=results.map(r=>`${r.ok?"PASS":"FAIL"} — ${r.name}: ${r.detail}`);
+  console.log(`MONITOR_CHECK ${allOk?"PASS":"FAIL"}\n${lines.join("\n")}`);
+  const alertTo=process.env.ALERT_EMAIL_TO;
+  if(alertTo){
+    await sendMail({
+      to:alertTo,
+      subject:`Carbon Copy Accounting — monthly check: ${allOk?"all clear":"needs attention"}`,
+      text:lines.join("\n"),
+    });
+  }
+  return{ok:allOk,results};
+}
+
 // Maintenance commands: run schema/reference-data init (always needed), then exit
 // without starting the server if a one-time data operation was explicitly requested.
 // Normal boot (`npm start` / `node server.js`) never touches transaction/receipt data.
 await init();
-const maintenanceFlag=process.argv.find(a=>["--legacy-cleanup","--seed-once","--purge-expired"].includes(a));
+const maintenanceFlag=process.argv.find(a=>["--legacy-cleanup","--seed-once","--purge-expired","--backup","--monitor"].includes(a));
 if(maintenanceFlag){
   if(maintenanceFlag==="--legacy-cleanup")await legacyReceiptCleanup();
   if(maintenanceFlag==="--seed-once")await seedInitialData();
   if(maintenanceFlag==="--purge-expired")await purgeExpiredReceipts();
+  if(maintenanceFlag==="--backup")await backupDatabase();
+  if(maintenanceFlag==="--monitor")await runMonitorCheck();
   console.log(`${maintenanceFlag} complete`);
   await pool.end();
   process.exit(0);

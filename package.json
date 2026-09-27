@@ -7,14 +7,18 @@
     "test": "bash tests/run.sh",
     "maintenance:legacy-cleanup": "node server.js --legacy-cleanup",
     "maintenance:seed-once": "node server.js --seed-once",
-    "maintenance:purge-expired": "node server.js --purge-expired"
+    "maintenance:purge-expired": "node server.js --purge-expired",
+    "maintenance:backup": "node server.js --backup",
+    "maintenance:monitor": "node server.js --monitor"
   },
   "engines": {
     "node": ">=20"
   },
   "dependencies": {
+    "aws4fetch": "^1.0.20",
     "express": "^5.1.0",
     "multer": "^2.0.2",
+    "nodemailer": "^10.0.11",
     "pg": "^8.16.3",
     "sharp": "^0.34.4",
     "tesseract.js": "^6.0.1"
