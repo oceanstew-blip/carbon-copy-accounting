@@ -325,6 +325,13 @@ async function init(){
       approved BOOLEAN NOT NULL DEFAULT TRUE,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
     CREATE TABLE IF NOT EXISTS month_closes(
       id BIGSERIAL PRIMARY KEY,month_start DATE NOT NULL UNIQUE,calculated_total NUMERIC(12,2),closed BOOLEAN NOT NULL DEFAULT FALSE,closed_at TIMESTAMPTZ);
+    CREATE TABLE IF NOT EXISTS import_batches(
+      id BIGSERIAL PRIMARY KEY,card_id BIGINT REFERENCES cards(id) ON DELETE SET NULL,source_filename TEXT,
+      file_hash TEXT UNIQUE,uploaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),statement_start DATE,statement_end DATE,
+      row_count INT,imported_by TEXT NOT NULL DEFAULT 'captain');
+    ALTER TABLE transactions ADD COLUMN IF NOT EXISTS import_batch_id BIGINT REFERENCES import_batches(id) ON DELETE SET NULL;
+    ALTER TABLE transactions ADD COLUMN IF NOT EXISTS source_row_number INT;
+    ALTER TABLE transactions ADD COLUMN IF NOT EXISTS duplicate_status TEXT NOT NULL DEFAULT 'none' CHECK(duplicate_status IN('none','suspected'));
   `);
   await pool.query("INSERT INTO cards(label,last4) VALUES($1,$2) ON CONFLICT(last4) DO NOTHING",["Capital One","0945"]);
   const cats=["Fuel & Lubricants","Dockage / Marina","Repairs & Maintenance","Provisions","Supplies","Insurance","Communications / Internet","Crew Travel","Crew Meals","Training / Certifications","Safety Equipment","Tender / Toys","Professional Services","Shipping / Freight","Customs / Port Fees","Guest Expenses","Transportation","Capital Improvements","Owner / Personal","Navigation / Weather","Miscellaneous"];
@@ -459,7 +466,8 @@ app.get("/api/dashboard",async(req,res,next)=>{try{
     pool.query(`SELECT COUNT(*)::int transactions,COALESCE(SUM(t.amount),0)::numeric total_spend,
       COUNT(*) FILTER(WHERE t.category_id IS NULL)::int needs_category,
       COUNT(*) FILTER(WHERE r.id IS NULL)::int missing_receipts,
-      COUNT(*) FILTER(WHERE t.captain_reviewed=false)::int needs_review
+      COUNT(*) FILTER(WHERE t.captain_reviewed=false)::int needs_review,
+      COUNT(*) FILTER(WHERE t.duplicate_status='suspected')::int suspected_duplicates
       FROM transactions t LEFT JOIN receipts r ON r.transaction_id=t.id
       WHERE t.status='posted' AND t.transaction_date >= $1::date AND t.transaction_date < $2::date`,[start,n]),
     pool.query(`SELECT COALESCE(c.name,'Uncategorized') name,COALESCE(SUM(t.amount),0)::numeric total
@@ -475,7 +483,7 @@ app.get("/api/dashboard",async(req,res,next)=>{try{
 app.get("/api/transactions",async(req,res,next)=>{try{
   const {start,next:n}=monthBounds(req.query.month);
   const q=await pool.query(`SELECT t.id,t.transaction_date,t.posted_date,t.vendor_raw,t.vendor_normalized,t.amount,t.notes,t.status,t.captain_reviewed,
-    c.id category_id,c.name category_name,cd.last4,r.id receipt_id,r.file_name,r.expires_at,r.purged_at,t.payment_method,t.payment_reference
+    c.id category_id,c.name category_name,cd.last4,r.id receipt_id,r.file_name,r.expires_at,r.purged_at,t.payment_method,t.payment_reference,t.duplicate_status
     FROM transactions t LEFT JOIN categories c ON c.id=t.category_id LEFT JOIN cards cd ON cd.id=t.card_id LEFT JOIN receipts r ON r.transaction_id=t.id
     WHERE t.transaction_date >= $1::date AND t.transaction_date < $2::date ORDER BY t.transaction_date DESC,t.id DESC`,[start,n]);
   res.json({rows:q.rows})
@@ -484,8 +492,26 @@ app.get("/api/transactions",async(req,res,next)=>{try{
 app.post("/api/transactions",async(req,res,next)=>{try{
   const rows=Array.isArray(req.body.rows)?req.body.rows:[req.body];
   const card=(await pool.query("SELECT id FROM cards WHERE last4='0945' LIMIT 1")).rows[0];
-  let inserted=0,skipped=0;
-  for(const x of rows){
+
+  // Whole-file re-upload safety: if the client sends a hash of the source file,
+  // re-uploading the exact same statement is a safe no-op instead of relying on
+  // per-row fingerprint collisions (which can't tell "same file again" apart
+  // from "two legitimately identical charges" — see below).
+  let batchId=null;
+  if(req.body.file_hash){
+    const existing=(await pool.query("SELECT id,row_count FROM import_batches WHERE file_hash=$1",[req.body.file_hash])).rows[0];
+    if(existing){
+      return res.status(201).json({inserted:0,skipped:rows.length,suspected_duplicates:0,receipts_matched:0,duplicate_import:true,batch_id:existing.id});
+    }
+    const dates=rows.map(r=>String(r.transaction_date||r.date||"").slice(0,10)).filter(d=>/^\d{4}-\d{2}-\d{2}$/.test(d)).sort();
+    const batch=await pool.query(`INSERT INTO import_batches(card_id,source_filename,file_hash,statement_start,statement_end,row_count)
+      VALUES($1,$2,$3,$4,$5,$6) RETURNING id`,[card?.id||null,req.body.source_filename||null,req.body.file_hash,dates[0]||null,dates[dates.length-1]||null,rows.length]);
+    batchId=batch.rows[0].id;
+  }
+
+  let inserted=0,skipped=0,suspected=0;
+  for(let i=0;i<rows.length;i++){
+    const x=rows[i];
     const r={...x};
     r.transaction_date=String(r.transaction_date||r.date||"").slice(0,10);
     r.posted_date=r.posted_date?String(r.posted_date).slice(0,10):null;
@@ -494,17 +520,33 @@ app.post("/api/transactions",async(req,res,next)=>{try{
     r.card_last4=String(r.card_last4||r.card_no||"0945").replace(/\D/g,"").slice(-4).padStart(4,"0");
     r.payment_method=["credit_card","wire","check","cash"].includes(r.payment_method)?r.payment_method:"credit_card";
     if(!/^\d{4}-\d{2}-\d{2}$/.test(r.transaction_date)||!r.vendor_raw||r.amount===null){skipped++;continue}
-    r.external_id=r.external_id||fingerprint(r);
+    const clientSuppliedId=Boolean(r.external_id);
+    const fp=fingerprint(r);
     const rule=(await pool.query("SELECT category_id FROM vendor_rules WHERE $1 ILIKE '%'||vendor_pattern||'%' ORDER BY length(vendor_pattern) DESC LIMIT 1",[r.vendor_raw])).rows[0];
     const cardRow=(await pool.query("SELECT id FROM cards WHERE last4=$1 LIMIT 1",[r.card_last4])).rows[0]||card;
-    try{
-      await pool.query(`INSERT INTO transactions(transaction_date,posted_date,vendor_raw,vendor_normalized,amount,category_id,card_id,source,external_id,status,payment_method,payment_reference)
-        VALUES($1,$2,$3,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,[r.transaction_date,r.posted_date,r.vendor_raw,r.amount,rule?.category_id||null,r.payment_method==="credit_card"?(cardRow?.id||null):null,r.source||"import",r.external_id,r.status==="pending"?"pending":"posted",r.payment_method,r.payment_reference||null]);
-      inserted++
-    }catch(e){if(e.code==="23505")skipped++;else throw e}
+    const insertArgs=(extId,dupStatus)=>[r.transaction_date,r.posted_date,r.vendor_raw,r.amount,rule?.category_id||null,r.payment_method==="credit_card"?(cardRow?.id||null):null,r.source||"import",extId,r.status==="pending"?"pending":"posted",r.payment_method,r.payment_reference||null,batchId,i,dupStatus];
+    const insertSql=`INSERT INTO transactions(transaction_date,posted_date,vendor_raw,vendor_normalized,amount,category_id,card_id,source,external_id,status,payment_method,payment_reference,import_batch_id,source_row_number,duplicate_status)
+        VALUES($1,$2,$3,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`;
+    if(clientSuppliedId){
+      // A stable id from the client (e.g. a bank transaction id) means we can tell
+      // for certain this is the same source row, not just a similar-looking one.
+      try{
+        await pool.query(insertSql,insertArgs(r.external_id,"none"));
+        inserted++
+      }catch(e){if(e.code==="23505")skipped++;else throw e}
+      continue;
+    }
+    // No stable id: a fingerprint match is ambiguous — could be a genuine
+    // re-import, or two legitimately identical charges (same vendor/amount/day).
+    // Never drop it silently; insert it flagged for review instead.
+    const already=(await pool.query("SELECT COUNT(*)::int c FROM transactions WHERE external_id LIKE $1",[fp+"%"])).rows[0].c;
+    const extId=already?`${fp}#${already}`:fp;
+    await pool.query(insertSql,insertArgs(extId,already?"suspected":"none"));
+    inserted++;
+    if(already)suspected++;
   }
   const matched=await matchAllReceipts();
-  res.status(201).json({inserted,skipped,receipts_matched:matched})
+  res.status(201).json({inserted,skipped,suspected_duplicates:suspected,receipts_matched:matched,batch_id:batchId})
 }catch(e){next(e)}});
 
 app.patch("/api/transactions/:id",async(req,res,next)=>{try{
@@ -516,8 +558,9 @@ app.patch("/api/transactions/:id",async(req,res,next)=>{try{
   const vendorName=b.vendor_normalized===undefined?(c.vendor_normalized||c.vendor_raw):b.vendor_normalized;
   const paymentMethod=b.payment_method===undefined?c.payment_method:b.payment_method;
   const paymentReference=b.payment_reference===undefined?c.payment_reference:b.payment_reference;
-  await pool.query("UPDATE transactions SET category_id=$1,notes=$2,captain_reviewed=$3,vendor_normalized=$4,payment_method=$5,payment_reference=$6,updated_at=NOW() WHERE id=$7",[
-    newCategory,b.notes===undefined?c.notes:b.notes,reviewed,vendorName,paymentMethod,paymentReference,id]);
+  const duplicateStatus=b.duplicate_status==="none"?"none":c.duplicate_status;
+  await pool.query("UPDATE transactions SET category_id=$1,notes=$2,captain_reviewed=$3,vendor_normalized=$4,payment_method=$5,payment_reference=$6,duplicate_status=$7,updated_at=NOW() WHERE id=$8",[
+    newCategory,b.notes===undefined?c.notes:b.notes,reviewed,vendorName,paymentMethod,paymentReference,duplicateStatus,id]);
   if(b.category_id!==undefined&&b.category_id!==null){
     await pool.query(`INSERT INTO vendor_rules(vendor_pattern,category_id) VALUES($1,$2)
       ON CONFLICT(vendor_pattern) DO UPDATE SET category_id=EXCLUDED.category_id,approved=true`,[vendorName,Number(b.category_id)]);
@@ -775,10 +818,11 @@ app.post("/api/close-month",async(req,res,next)=>{try{
   const {month,start,next:n}=monthBounds(req.body.month);
   const q=await pool.query(`SELECT COUNT(*) FILTER(WHERE t.category_id IS NULL)::int uncategorized,
     COUNT(*) FILTER(WHERE r.id IS NULL)::int missing_receipts,COUNT(*) FILTER(WHERE t.captain_reviewed=false)::int unreviewed,
+    COUNT(*) FILTER(WHERE t.duplicate_status='suspected')::int suspected_duplicates,
     COALESCE(SUM(t.amount),0)::numeric total FROM transactions t LEFT JOIN receipts r ON r.transaction_id=t.id
     WHERE t.status='posted' AND t.transaction_date >= $1::date AND t.transaction_date < $2::date`,[start,n]);
   const c=q.rows[0],u=(await pool.query("SELECT COUNT(*)::int count FROM receipts WHERE transaction_id IS NULL AND receipt_date >= $1::date AND receipt_date < $2::date",[start,n])).rows[0].count;
-  if(c.uncategorized||c.missing_receipts||c.unreviewed||u)return res.status(409).json({closed:false,blockers:{...c,unmatched_receipts:u}});
+  if(c.uncategorized||c.missing_receipts||c.unreviewed||c.suspected_duplicates||u)return res.status(409).json({closed:false,blockers:{...c,unmatched_receipts:u}});
   await pool.query(`INSERT INTO month_closes(month_start,calculated_total,closed,closed_at) VALUES($1,$2,true,NOW())
     ON CONFLICT(month_start) DO UPDATE SET calculated_total=EXCLUDED.calculated_total,closed=true,closed_at=NOW()`,[start,Number(c.total)]);
   res.json({closed:true,month})

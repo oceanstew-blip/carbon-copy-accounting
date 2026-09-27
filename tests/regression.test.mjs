@@ -134,12 +134,30 @@ test("duplicate external_id import is safe (no duplicate insert)", async () => {
   assert.equal(second.skipped, 1);
 });
 
-test("legitimate repeated identical-looking charges are not silently discarded (different external_id)", async () => {
-  const base = { transaction_date: "2026-09-13", vendor_raw: "Boca Resort Cafe", amount: 6 };
-  const a = await (await apiFetch("/api/transactions", { method: "POST", body: JSON.stringify({ ...base, external_id: "rep-a-" + crypto.randomUUID() }) })).json();
-  const b = await (await apiFetch("/api/transactions", { method: "POST", body: JSON.stringify({ ...base, external_id: "rep-b-" + crypto.randomUUID() }) })).json();
-  assert.equal(a.inserted, 1);
-  assert.equal(b.inserted, 1, "two distinct $6 charges same vendor/day must both post");
+test("legitimate repeated identical-looking charges are not silently discarded (no external_id — ambiguous fingerprint)", async () => {
+  // No external_id supplied on either row: same vendor/amount/day, indistinguishable
+  // from a true duplicate. Priority 3 requires both to post, second one flagged.
+  const base = { transaction_date: "2026-09-13", vendor_raw: "Boca Resort Cafe Regression " + crypto.randomUUID(), amount: 6 };
+  const res = await apiFetch("/api/transactions", { method: "POST", body: JSON.stringify({ rows: [base, base] }) });
+  const body = await res.json();
+  assert.equal(body.inserted, 2, "two distinct $6 charges same vendor/day must both post, not collapse to one");
+  assert.equal(body.suspected_duplicates, 1, "the second one must be flagged, not silently dropped");
+  const list = await (await apiFetch(`/api/transactions?month=2026-09`)).json();
+  const rows = list.rows.filter((r) => r.vendor_raw === base.vendor_raw);
+  assert.equal(rows.length, 2);
+  assert.deepEqual(rows.map((r) => r.duplicate_status).sort(), ["none", "suspected"]);
+});
+
+test("uploading the same statement file twice is a safe no-op", async () => {
+  const hash = "test-file-hash-" + crypto.randomUUID();
+  const payload = { file_hash: hash, source_filename: "test.csv", rows: [
+    { transaction_date: "2026-07-01", vendor_raw: "Batch Vendor " + crypto.randomUUID(), amount: 10 },
+  ] };
+  const first = await (await apiFetch("/api/transactions", { method: "POST", body: JSON.stringify(payload) })).json();
+  const second = await (await apiFetch("/api/transactions", { method: "POST", body: JSON.stringify(payload) })).json();
+  assert.equal(first.inserted, 1);
+  assert.equal(second.duplicate_import, true);
+  assert.equal(second.inserted, 0);
 });
 
 // ---- Categories ----
