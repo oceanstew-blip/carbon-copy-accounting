@@ -69,7 +69,7 @@ function loginPage({error}={}){
     <h1>Accounting</h1>
     ${error?`<div class="error">${error}</div>`:""}
     <label for="u">Username</label>
-    <input id="u" name="username" autocomplete="username" autofocus>
+    <input id="u" name="username" autocomplete="username" autocapitalize="off" autocorrect="off" spellcheck="false" autofocus>
     <label for="p">Password</label>
     <input id="p" name="password" type="password" autocomplete="current-password">
     <button type="submit">Sign in</button>
@@ -98,7 +98,10 @@ app.get("/login",(_req,res)=>res.type("html").send(loginPage()));
 app.post("/login",(req,res)=>{
   const user=process.env.APP_USERNAME,pass=process.env.APP_PASSWORD;
   const {username,password}=req.body||{};
-  if(username!==user||password!==pass)return res.status(401).type("html").send(loginPage({error:"Incorrect username or password."}));
+  // Username isn't a secret, so tolerate the phone-keyboard auto-capitalized
+  // first letter that broke the captain's own login attempt (2026-09-27).
+  // Password stays case-sensitive.
+  if(String(username||"").toLowerCase()!==String(user).toLowerCase()||password!==pass)return res.status(401).type("html").send(loginPage({error:"Incorrect username or password."}));
   const token=signSession(user);
   res.cookie("ccc_session",token,{httpOnly:true,secure:req.secure,sameSite:"lax",maxAge:SESSION_MAX_AGE_MS});
   res.redirect("/");
