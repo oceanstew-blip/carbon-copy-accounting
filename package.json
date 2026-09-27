@@ -10,7 +10,8 @@
     "maintenance:purge-expired": "node server.js --purge-expired",
     "maintenance:backup": "node server.js --backup",
     "maintenance:monitor": "node server.js --monitor",
-    "maintenance:pull-receipts": "node server.js --pull-receipts"
+    "maintenance:pull-receipts": "node server.js --pull-receipts",
+    "maintenance:alerts": "node server.js --alerts"
   },
   "engines": {
     "node": ">=20"

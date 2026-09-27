@@ -1346,6 +1346,56 @@ async function pullReceiptEmails(){
   return{pulled,skipped,errors};
 }
 
+// The three states that genuinely need the captain to make a decision — not
+// housekeeping (missing receipt, uncategorized) but an actual yes/no call:
+// approve or decline a large charge, confirm or reject a suspected duplicate,
+// or close out a month that's already clean and waiting.
+async function sendAlertDigest(){
+  const alertTo=process.env.ALERT_EMAIL_TO;
+  if(!alertTo){console.log("ALERTS_SKIPPED: ALERT_EMAIL_TO not configured");return{sent:false}}
+  const approvals=(await pool.query(`SELECT id,transaction_date,vendor_raw,amount FROM transactions
+    WHERE approval_status='needed' AND status='posted' ORDER BY transaction_date`)).rows;
+  const duplicates=(await pool.query(`SELECT id,transaction_date,vendor_raw,amount FROM transactions
+    WHERE duplicate_status='suspected' AND status='posted' ORDER BY transaction_date`)).rows;
+  const {month,start,next:n}=monthBounds();
+  const blockers=(await pool.query(`SELECT COUNT(*) FILTER(WHERE t.category_id IS NULL)::int uncategorized,
+      COUNT(*) FILTER(WHERE r.id IS NULL)::int missing_receipts,COUNT(*) FILTER(WHERE t.captain_reviewed=false)::int unreviewed,
+      COUNT(*) FILTER(WHERE t.duplicate_status='suspected')::int suspected_duplicates,
+      COUNT(*) FILTER(WHERE t.approval_status='needed')::int owner_approval_needed
+    FROM transactions t LEFT JOIN receipts r ON r.transaction_id=t.id
+    WHERE t.status='posted' AND t.transaction_date>=$1::date AND t.transaction_date<$2::date`,[start,n])).rows[0];
+  const alreadyClosed=(await pool.query("SELECT closed FROM month_closes WHERE month_start=$1",[start])).rows[0]?.closed;
+  const monthReady=!alreadyClosed&&Object.values(blockers).every((v)=>v===0);
+
+  if(!approvals.length&&!duplicates.length&&!monthReady){
+    console.log("ALERTS_COMPLETE nothing to report");
+    return{sent:false,reason:"nothing to report"};
+  }
+  const lines=[];
+  if(approvals.length){
+    lines.push(`OWNER APPROVAL NEEDED (${approvals.length}):`);
+    for(const t of approvals)lines.push(`  ${String(t.transaction_date).slice(0,10)} — ${t.vendor_raw} — $${Number(t.amount).toFixed(2)}`);
+    lines.push("");
+  }
+  if(duplicates.length){
+    lines.push(`SUSPECTED DUPLICATES (${duplicates.length}):`);
+    for(const t of duplicates)lines.push(`  ${String(t.transaction_date).slice(0,10)} — ${t.vendor_raw} — $${Number(t.amount).toFixed(2)}`);
+    lines.push("");
+  }
+  if(monthReady)lines.push(`${month} has no open items and is ready to close.`);
+  await sendMail({to:alertTo,subject:"Carbon Copy Accounting — needs a decision",text:lines.join("\n")});
+  console.log(`ALERTS_COMPLETE sent: ${approvals.length} approvals, ${duplicates.length} duplicates, month_ready=${monthReady}`);
+  return{sent:true,approvals:approvals.length,duplicates:duplicates.length,monthReady};
+}
+
+// Cron can't express "3 days before the 1st of next month" directly — month
+// lengths vary — so this runs daily and only actually does anything on that day.
+function isThreeDaysBeforeMonthEnd(date=new Date()){
+  const y=date.getUTCFullYear(),m=date.getUTCMonth();
+  const daysInMonth=new Date(Date.UTC(y,m+1,0)).getUTCDate();
+  return date.getUTCDate()===daysInMonth-2;
+}
+
 async function runMonitorCheck(){
   const results=[];
   const check=async(name,fn)=>{try{const detail=await fn();results.push({name,ok:true,detail})}catch(e){results.push({name,ok:false,detail:e.message})}};
@@ -1385,14 +1435,18 @@ async function runMonitorCheck(){
 // without starting the server if a one-time data operation was explicitly requested.
 // Normal boot (`npm start` / `node server.js`) never touches transaction/receipt data.
 await init();
-const maintenanceFlag=process.argv.find(a=>["--legacy-cleanup","--seed-once","--purge-expired","--backup","--monitor","--pull-receipts"].includes(a));
+const maintenanceFlag=process.argv.find(a=>["--legacy-cleanup","--seed-once","--purge-expired","--backup","--monitor","--pull-receipts","--alerts"].includes(a));
 if(maintenanceFlag){
   if(maintenanceFlag==="--legacy-cleanup")await legacyReceiptCleanup();
   if(maintenanceFlag==="--seed-once")await seedInitialData();
   if(maintenanceFlag==="--purge-expired")await purgeExpiredReceipts();
   if(maintenanceFlag==="--backup")await backupDatabase();
-  if(maintenanceFlag==="--monitor")await runMonitorCheck();
+  if(maintenanceFlag==="--monitor"){
+    if(isThreeDaysBeforeMonthEnd())await runMonitorCheck();
+    else console.log("MONITOR_SKIPPED: not 3 days before month end (runs daily, only acts on that day)");
+  }
   if(maintenanceFlag==="--pull-receipts")await pullReceiptEmails();
+  if(maintenanceFlag==="--alerts")await sendAlertDigest();
   console.log(`${maintenanceFlag} complete`);
   await pool.end();
   process.exit(0);
