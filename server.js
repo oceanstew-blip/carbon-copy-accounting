@@ -316,6 +316,10 @@ async function init(){
     ALTER TABLE receipts ADD COLUMN IF NOT EXISTS ocr_confidence INT;
     ALTER TABLE receipts ADD COLUMN IF NOT EXISTS ocr_field_score INT;
     ALTER TABLE receipts ADD COLUMN IF NOT EXISTS ocr_review_reasons TEXT;
+    ALTER TABLE receipts ADD COLUMN IF NOT EXISTS match_method TEXT;
+    ALTER TABLE receipts ADD COLUMN IF NOT EXISTS match_score INT;
+    ALTER TABLE receipts ADD COLUMN IF NOT EXISTS matched_at TIMESTAMPTZ;
+    ALTER TABLE receipts ADD COLUMN IF NOT EXISTS matched_by TEXT;
     ALTER TABLE receipts ALTER COLUMN file_data DROP NOT NULL;
     ALTER TABLE transactions ADD COLUMN IF NOT EXISTS payment_method TEXT NOT NULL DEFAULT 'credit_card';
     ALTER TABLE transactions ADD COLUMN IF NOT EXISTS payment_reference TEXT;
@@ -382,23 +386,45 @@ async function seedInitialData(){
     await autoMatchReceipt(q.rows[0].id);
   }
 }
-async function autoMatchReceipt(receiptId){
-  const r=(await pool.query("SELECT * FROM receipts WHERE id=$1",[receiptId])).rows[0];
-  if(!r||r.transaction_id||r.amount==null||!r.receipt_date||r.payment_method&&r.payment_method!=="credit_card")return null;
+function vendorSimilar(a,b){
+  a=String(a||"").trim().toUpperCase();b=String(b||"").trim().toUpperCase();
+  if(!a||!b)return false;
+  return a.includes(b)||b.includes(a);
+}
+// Candidate transactions for a receipt, scored (not just amount+date). Never
+// auto-links on amount+date alone if more than one transaction is plausible —
+// that's how the wrong receipt gets attached to the wrong charge.
+async function receiptMatchCandidates(r){
   const q=await pool.query(`
-    SELECT t.id,t.transaction_date,t.vendor_raw,t.amount,
+    SELECT t.id,t.transaction_date,t.posted_date,t.vendor_raw,t.amount,cd.last4,
       ABS(t.transaction_date-$2::date) day_gap
     FROM transactions t
     LEFT JOIN receipts rr ON rr.transaction_id=t.id
+    LEFT JOIN cards cd ON cd.id=t.card_id
     WHERE rr.id IS NULL AND t.status='posted'
       AND ABS(t.amount-$1::numeric) < 0.02
       AND t.transaction_date BETWEEN $2::date-INTERVAL '4 days' AND $2::date+INTERVAL '4 days'
-    ORDER BY ABS(t.transaction_date-$2::date),t.id LIMIT 3`,[r.amount,r.receipt_date]);
-  if(q.rows.length!==1)return null;
-  const t=q.rows[0];
-  await pool.query("UPDATE receipts SET transaction_id=$1 WHERE id=$2",[t.id,r.id]);
-  if(r.category_id)await pool.query("UPDATE transactions SET category_id=COALESCE(category_id,$1),captain_reviewed=true,updated_at=NOW() WHERE id=$2",[r.category_id,t.id]);
-  return t.id;
+    ORDER BY t.transaction_date,t.id LIMIT 8`,[r.amount,r.receipt_date]);
+  return q.rows.map(t=>{
+    const vendorMatch=vendorSimilar(r.vendor,t.vendor_raw);
+    const score=(vendorMatch?60:0)+Math.max(0,30-t.day_gap*10)+(t.day_gap===0?10:0);
+    return {...t,vendor_match:vendorMatch,score};
+  }).sort((a,b)=>b.score-a.score);
+}
+async function autoMatchReceipt(receiptId){
+  const r=(await pool.query("SELECT * FROM receipts WHERE id=$1",[receiptId])).rows[0];
+  if(!r||r.transaction_id||r.amount==null||!r.receipt_date||r.payment_method&&r.payment_method!=="credit_card")return null;
+  const candidates=await receiptMatchCandidates(r);
+  if(!candidates.length)return null;
+  const [best,second]=candidates;
+  // Strong match: clearly better than the runner-up, and has real signal behind
+  // it (same day, or vendor text actually matches) — not just "closest amount".
+  const strong=best.score>=60&&(!second||best.score-second.score>=20);
+  if(!strong)return null;
+  const method=best.vendor_match?"amount+date+vendor":"amount+date";
+  await pool.query("UPDATE receipts SET transaction_id=$1,match_method=$2,match_score=$3,matched_at=NOW(),matched_by='system' WHERE id=$4",[best.id,method,best.score,r.id]);
+  if(r.category_id)await pool.query("UPDATE transactions SET category_id=COALESCE(category_id,$1),captain_reviewed=true,updated_at=NOW() WHERE id=$2",[r.category_id,best.id]);
+  return best.id;
 }
 async function purgeExpiredReceipts(){
   await pool.query(`UPDATE receipts SET file_data=NULL,source_url=NULL,purged_at=NOW()
@@ -790,6 +816,29 @@ app.patch("/api/receipts/:id",async(req,res,next)=>{try{
   }
   res.json({ok:true,created_transaction_id:createdTransactionId,matched_transaction_id:matched,payment_method:paymentMethod});
 }catch(e){next(e)}});
+
+app.get("/api/receipts/:id/candidates",async(req,res,next)=>{try{
+  const r=(await pool.query("SELECT * FROM receipts WHERE id=$1",[Number(req.params.id)])).rows[0];
+  if(!r)return res.status(404).json({error:"Not found"});
+  if(r.transaction_id)return res.json({already_matched:true,transaction_id:r.transaction_id,candidates:[]});
+  if(r.amount==null||!r.receipt_date)return res.json({candidates:[],reason:"Receipt needs an amount and date before it can be matched"});
+  res.json({candidates:await receiptMatchCandidates(r)});
+}catch(e){next(e)}});
+
+app.post("/api/receipts/:id/match",async(req,res,next)=>{try{
+  const receiptId=Number(req.params.id),transactionId=Number(req.body.transaction_id);
+  if(!Number.isFinite(receiptId)||!Number.isFinite(transactionId))return res.status(400).json({error:"receipt id and transaction_id required"});
+  const r=(await pool.query("SELECT id,category_id FROM receipts WHERE id=$1",[receiptId])).rows[0];
+  if(!r)return res.status(404).json({error:"Receipt not found"});
+  const t=(await pool.query("SELECT id FROM transactions WHERE id=$1",[transactionId])).rows[0];
+  if(!t)return res.status(404).json({error:"Transaction not found"});
+  const taken=(await pool.query("SELECT id FROM receipts WHERE transaction_id=$1",[transactionId])).rows[0];
+  if(taken)return res.status(409).json({error:"That transaction already has a receipt attached"});
+  await pool.query("UPDATE receipts SET transaction_id=$1,match_method='manual',match_score=NULL,matched_at=NOW(),matched_by='captain' WHERE id=$2",[transactionId,receiptId]);
+  if(r.category_id)await pool.query("UPDATE transactions SET category_id=COALESCE(category_id,$1),captain_reviewed=true,updated_at=NOW() WHERE id=$2",[r.category_id,transactionId]);
+  res.json({ok:true});
+}catch(e){next(e)}});
+
 app.get("/api/receipts/:id",async(req,res,next)=>{try{
   const q=await pool.query("SELECT file_name,content_type,file_data,source_url,purged_at FROM receipts WHERE id=$1",[Number(req.params.id)]);const r=q.rows[0];if(!r)return res.sendStatus(404);
   if(r.purged_at)return res.status(410).send("Receipt file expired after 60 days.");

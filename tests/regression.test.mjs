@@ -264,6 +264,59 @@ test("month close is blocked when there are uncategorized transactions", async (
   assert.ok(body.blockers.uncategorized > 0);
 });
 
+// ---- Receipt matching (Priority 4) ----
+
+async function insertBareReceipt({ vendor, amount, receipt_date, payment_method = "credit_card" }) {
+  const q = await pool.query(
+    `INSERT INTO receipts(file_name,content_type,file_size,file_data,receipt_date,vendor,amount,payment_method,review_required)
+     VALUES($1,'image/png',0,NULL,$2,$3,$4,$5,true) RETURNING id`,
+    [`test-${crypto.randomUUID()}.png`, receipt_date, vendor, amount, payment_method]
+  );
+  return q.rows[0].id;
+}
+
+test("strong match (same-day + vendor text match) auto-links on next transaction insert", async () => {
+  const vendorTag = "MatchTestMarine" + crypto.randomUUID().slice(0, 8);
+  const receiptId = await insertBareReceipt({ vendor: vendorTag, amount: 42.5, receipt_date: "2026-09-20" });
+  await apiFetch("/api/transactions", {
+    method: "POST",
+    body: JSON.stringify({ transaction_date: "2026-09-20", vendor_raw: vendorTag + " SUPPLY CO", amount: 42.5, external_id: "test-match-" + crypto.randomUUID() }),
+  });
+  const check = await (await apiFetch(`/api/receipts/${receiptId}/candidates`)).json();
+  assert.equal(check.already_matched, true, "receipt should have auto-linked");
+});
+
+test("ambiguous match (no vendor signal, tied candidates) does not auto-link", async () => {
+  const tag = crypto.randomUUID().slice(0, 8);
+  const receiptId = await insertBareReceipt({ vendor: null, amount: 17.77, receipt_date: "2026-09-21" });
+  await apiFetch("/api/transactions", {
+    method: "POST",
+    body: JSON.stringify({ rows: [
+      { transaction_date: "2026-09-21", vendor_raw: "Ambiguous Vendor A " + tag, amount: 17.77, external_id: "amb-a-" + crypto.randomUUID() },
+      { transaction_date: "2026-09-21", vendor_raw: "Ambiguous Vendor B " + tag, amount: 17.77, external_id: "amb-b-" + crypto.randomUUID() },
+    ] }),
+  });
+  const check = await (await apiFetch(`/api/receipts/${receiptId}/candidates`)).json();
+  assert.equal(check.already_matched, undefined, "must not have guessed between two equally plausible candidates");
+  assert.ok(check.candidates.length >= 2, "both candidates should be surfaced for the captain to choose from");
+});
+
+test("captain can manually resolve an ambiguous match", async () => {
+  const tag = crypto.randomUUID().slice(0, 8);
+  const receiptId = await insertBareReceipt({ vendor: null, amount: 88.5, receipt_date: "2026-09-22" });
+  await apiFetch("/api/transactions", {
+    method: "POST",
+    body: JSON.stringify({ transaction_date: "2026-09-22", vendor_raw: "Manual Match Vendor " + tag, amount: 88.5, external_id: "manual-match-" + crypto.randomUUID() }),
+  });
+  const candidates = await (await apiFetch(`/api/receipts/${receiptId}/candidates`)).json();
+  const txId = candidates.candidates[0].id;
+  const res = await apiFetch(`/api/receipts/${receiptId}/match`, { method: "POST", body: JSON.stringify({ transaction_id: txId }) });
+  assert.equal(res.status, 200);
+  const after = await (await apiFetch(`/api/receipts/${receiptId}/candidates`)).json();
+  assert.equal(after.already_matched, true);
+  assert.equal(after.transaction_id, txId);
+});
+
 // ---- Runner ----
 
 async function run() {
