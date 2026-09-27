@@ -279,6 +279,17 @@ function monthBounds(month){
   return{month:m,start:m+"-01",next:new Date(Date.UTC(y,mo,1)).toISOString().slice(0,10)}
 }
 function moneyNum(v){const n=Number(v);return Number.isFinite(n)?Math.round(n*100)/100:null}
+async function audit(actor,action,entityType,entityId,oldData,newData,{reason,source}={}){
+  await pool.query(`INSERT INTO audit_log(actor,action,entity_type,entity_id,old_data,new_data,reason,source)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8)`,[actor,action,entityType,String(entityId),oldData?JSON.stringify(oldData):null,newData?JSON.stringify(newData):null,reason||null,source||null]);
+}
+async function assertMonthOpen(dateVal){
+  // pg returns DATE columns as JS Date objects, not strings — normalize first.
+  const iso=dateVal instanceof Date?dateVal.toISOString():String(dateVal);
+  const monthStart=iso.slice(0,7)+"-01";
+  const closed=(await pool.query("SELECT closed FROM month_closes WHERE month_start=$1",[monthStart])).rows[0]?.closed;
+  if(closed){const e=new Error(`${iso.slice(0,7)} is closed. Reopen the month before making this change.`);e.statusCode=409;throw e}
+}
 function fingerprint(r){
   return crypto.createHash("sha256").update([
     r.transaction_date||"",r.posted_date||"",String(r.card_last4||"0945").padStart(4,"0"),
@@ -336,6 +347,11 @@ async function init(){
     ALTER TABLE transactions ADD COLUMN IF NOT EXISTS import_batch_id BIGINT REFERENCES import_batches(id) ON DELETE SET NULL;
     ALTER TABLE transactions ADD COLUMN IF NOT EXISTS source_row_number INT;
     ALTER TABLE transactions ADD COLUMN IF NOT EXISTS duplicate_status TEXT NOT NULL DEFAULT 'none' CHECK(duplicate_status IN('none','suspected'));
+    CREATE TABLE IF NOT EXISTS audit_log(
+      id BIGSERIAL PRIMARY KEY,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      actor TEXT NOT NULL CHECK(actor IN('captain','system')),action TEXT NOT NULL,
+      entity_type TEXT NOT NULL,entity_id TEXT,old_data JSONB,new_data JSONB,reason TEXT,source TEXT);
+    CREATE INDEX IF NOT EXISTS audit_log_entity_idx ON audit_log(entity_type,entity_id);
   `);
   await pool.query("INSERT INTO cards(label,last4) VALUES($1,$2) ON CONFLICT(last4) DO NOTHING",["Capital One","0945"]);
   const cats=["Fuel & Lubricants","Dockage / Marina","Repairs & Maintenance","Provisions","Supplies","Insurance","Communications / Internet","Crew Travel","Crew Meals","Training / Certifications","Safety Equipment","Tender / Toys","Professional Services","Shipping / Freight","Customs / Port Fees","Guest Expenses","Transportation","Capital Improvements","Owner / Personal","Navigation / Weather","Miscellaneous"];
@@ -359,7 +375,8 @@ async function seedInitialData(){
     if(c){
       await pool.query(`INSERT INTO vendor_rules(vendor_pattern,category_id) VALUES($1,$2)
         ON CONFLICT(vendor_pattern) DO UPDATE SET category_id=EXCLUDED.category_id,approved=true`,[pattern,c.id]);
-      await pool.query(`UPDATE transactions SET category_id=$1,captain_reviewed=true,updated_at=NOW()
+      // vendor-rule match is system classification, not captain review (Priority 7)
+      await pool.query(`UPDATE transactions SET category_id=$1,updated_at=NOW()
         WHERE category_id IS NULL AND vendor_raw ILIKE '%'||$2||'%'`,[c.id,pattern]);
     }
   }
@@ -374,9 +391,6 @@ async function seedInitialData(){
     await pool.query(`INSERT INTO transactions(transaction_date,posted_date,vendor_raw,vendor_normalized,amount,category_id,card_id,source,external_id,status)
       VALUES($1,$2,$3,$3,$4,$5,$6,'capital-one-csv',$7,'posted') ON CONFLICT DO NOTHING`,
       [row.transaction_date,row.posted_date,row.vendor_raw,row.amount,rule?.category_id||null,card?.id||null,ext]);
-    if(rule?.category_id){
-      await pool.query("UPDATE transactions SET captain_reviewed=true WHERE external_id=$1",[ext]);
-    }
   }
   for(const r of driveReceipts){
     const c=(await pool.query("SELECT id FROM categories WHERE name=$1",[r.category])).rows[0];
@@ -423,7 +437,10 @@ async function autoMatchReceipt(receiptId){
   if(!strong)return null;
   const method=best.vendor_match?"amount+date+vendor":"amount+date";
   await pool.query("UPDATE receipts SET transaction_id=$1,match_method=$2,match_score=$3,matched_at=NOW(),matched_by='system' WHERE id=$4",[best.id,method,best.score,r.id]);
-  if(r.category_id)await pool.query("UPDATE transactions SET category_id=COALESCE(category_id,$1),captain_reviewed=true,updated_at=NOW() WHERE id=$2",[r.category_id,best.id]);
+  // system match: copy the receipt's category over if useful, but this is not
+  // the captain reviewing the transaction — captain_reviewed stays untouched.
+  if(r.category_id)await pool.query("UPDATE transactions SET category_id=COALESCE(category_id,$1),updated_at=NOW() WHERE id=$2",[r.category_id,best.id]);
+  await audit("system","auto_match","receipt",r.id,{transaction_id:null},{transaction_id:best.id,match_method:method,match_score:best.score},{source:"autoMatchReceipt"});
   return best.id;
 }
 async function purgeExpiredReceipts(){
@@ -535,7 +552,7 @@ app.post("/api/transactions",async(req,res,next)=>{try{
     batchId=batch.rows[0].id;
   }
 
-  let inserted=0,skipped=0,suspected=0;
+  let inserted=0,skipped=0,suspected=0,blockedClosedMonth=0;
   for(let i=0;i<rows.length;i++){
     const x=rows[i];
     const r={...x};
@@ -546,6 +563,7 @@ app.post("/api/transactions",async(req,res,next)=>{try{
     r.card_last4=String(r.card_last4||r.card_no||"0945").replace(/\D/g,"").slice(-4).padStart(4,"0");
     r.payment_method=["credit_card","wire","check","cash"].includes(r.payment_method)?r.payment_method:"credit_card";
     if(!/^\d{4}-\d{2}-\d{2}$/.test(r.transaction_date)||!r.vendor_raw||r.amount===null){skipped++;continue}
+    if((await pool.query("SELECT closed FROM month_closes WHERE month_start=$1",[r.transaction_date.slice(0,7)+"-01"])).rows[0]?.closed){blockedClosedMonth++;continue}
     const clientSuppliedId=Boolean(r.external_id);
     const fp=fingerprint(r);
     const rule=(await pool.query("SELECT category_id FROM vendor_rules WHERE $1 ILIKE '%'||vendor_pattern||'%' ORDER BY length(vendor_pattern) DESC LIMIT 1",[r.vendor_raw])).rows[0];
@@ -572,12 +590,13 @@ app.post("/api/transactions",async(req,res,next)=>{try{
     if(already)suspected++;
   }
   const matched=await matchAllReceipts();
-  res.status(201).json({inserted,skipped,suspected_duplicates:suspected,receipts_matched:matched,batch_id:batchId})
+  res.status(201).json({inserted,skipped,suspected_duplicates:suspected,blocked_closed_month:blockedClosedMonth,receipts_matched:matched,batch_id:batchId})
 }catch(e){next(e)}});
 
 app.patch("/api/transactions/:id",async(req,res,next)=>{try{
   const id=Number(req.params.id);if(!Number.isFinite(id))return res.status(400).json({error:"Invalid transaction id"});
   const c=(await pool.query("SELECT * FROM transactions WHERE id=$1",[id])).rows[0];if(!c)return res.status(404).json({error:"Not found"});
+  await assertMonthOpen(c.transaction_date);
   const b=req.body;
   const newCategory=b.category_id===undefined?c.category_id:b.category_id;
   const reviewed=b.category_id!==undefined&&b.category_id!==null?true:(b.captain_reviewed===undefined?c.captain_reviewed:b.captain_reviewed);
@@ -591,12 +610,17 @@ app.patch("/api/transactions/:id",async(req,res,next)=>{try{
     await pool.query(`INSERT INTO vendor_rules(vendor_pattern,category_id) VALUES($1,$2)
       ON CONFLICT(vendor_pattern) DO UPDATE SET category_id=EXCLUDED.category_id,approved=true`,[vendorName,Number(b.category_id)]);
   }
+  await audit("captain","update","transaction",id,
+    {category_id:c.category_id,notes:c.notes,captain_reviewed:c.captain_reviewed,vendor_normalized:c.vendor_normalized,payment_method:c.payment_method,payment_reference:c.payment_reference,duplicate_status:c.duplicate_status},
+    {category_id:newCategory,notes:b.notes===undefined?c.notes:b.notes,captain_reviewed:reviewed,vendor_normalized:vendorName,payment_method:paymentMethod,payment_reference:paymentReference,duplicate_status:duplicateStatus},
+    {source:"PATCH /api/transactions/:id"});
   res.json({ok:true,learned_vendor_rule:b.category_id!==undefined&&b.category_id!==null})
 }catch(e){next(e)}});
 
 app.post("/api/categories",async(req,res,next)=>{try{
   const name=String(req.body.name||"").trim();if(!name)return res.status(400).json({error:"Category required"});
   const q=await pool.query("INSERT INTO categories(name,sort_order) VALUES($1,999) ON CONFLICT(name) DO UPDATE SET active=true RETURNING id,name,sort_order",[name]);
+  await audit("captain","create","category",q.rows[0].id,null,q.rows[0],{source:"POST /api/categories"});
   res.status(201).json(q.rows[0])
 }catch(e){next(e)}});
 
@@ -607,7 +631,9 @@ app.patch("/api/categories/:id",async(req,res,next)=>{try{
   if(!exists)return res.status(404).json({error:"Category not found"});
   const dup=(await pool.query("SELECT id FROM categories WHERE lower(name)=lower($1) AND id<>$2",[name,id])).rows[0];
   if(dup)return res.status(409).json({error:"A category with that name already exists"});
+  const before=(await pool.query("SELECT name FROM categories WHERE id=$1",[id])).rows[0];
   const q=await pool.query("UPDATE categories SET name=$1 WHERE id=$2 RETURNING id,name,sort_order",[name,id]);
+  await audit("captain","rename","category",id,before,q.rows[0],{source:"PATCH /api/categories/:id"});
   res.json(q.rows[0]);
 }catch(e){next(e)}});
 
@@ -646,10 +672,12 @@ app.delete("/api/categories/:id",async(req,res,next)=>{try{
       await client.query("COMMIT");
     }catch(e){await client.query("ROLLBACK");throw e}
     finally{client.release()}
+    await audit("captain","delete","category",id,current,{reassigned_to:replacement,usage},{source:"DELETE /api/categories/:id"});
     return res.json({ok:true,deleted_id:id,reassigned_to:replacement,usage});
   }
 
   await pool.query("UPDATE categories SET active=false WHERE id=$1",[id]);
+  await audit("captain","delete","category",id,current,{usage},{source:"DELETE /api/categories/:id"});
   res.json({ok:true,deleted_id:id,usage});
 }catch(e){next(e)}});
 
@@ -657,8 +685,10 @@ app.delete("/api/categories/:id",async(req,res,next)=>{try{
 app.post("/api/vendor-rules",async(req,res,next)=>{try{
   const vendor=String(req.body.vendor_pattern||"").trim(),cid=Number(req.body.category_id);
   if(!vendor||!Number.isFinite(cid))return res.status(400).json({error:"Vendor and category required"});
+  const before=(await pool.query("SELECT id,vendor_pattern,category_id FROM vendor_rules WHERE vendor_pattern=$1",[vendor])).rows[0]||null;
   const q=await pool.query(`INSERT INTO vendor_rules(vendor_pattern,category_id) VALUES($1,$2)
     ON CONFLICT(vendor_pattern) DO UPDATE SET category_id=EXCLUDED.category_id,approved=true RETURNING id,vendor_pattern,category_id`,[vendor,cid]);
+  await audit("captain",before?"update":"create","vendor_rule",q.rows[0].id,before,q.rows[0],{source:"POST /api/vendor-rules"});
   res.status(201).json(q.rows[0])
 }catch(e){next(e)}});
 
@@ -676,7 +706,7 @@ async function repairOrphanNonCardReceipts(){
     const tr=await pool.query(`INSERT INTO transactions(transaction_date,posted_date,vendor_raw,vendor_normalized,amount,category_id,card_id,source,external_id,status,payment_method,payment_reference,captain_reviewed)
       VALUES($1,$1,$2,$2,$3,$4,NULL,'receipt-auto-repair',$5,'posted',$6,$7,$8)
       ON CONFLICT(external_id) WHERE external_id IS NOT NULL DO NOTHING RETURNING id`,[
-        r.receipt_date,r.vendor,Number(r.amount),r.category_id||null,ext,r.payment_method,r.payment_reference||null,Boolean(r.category_id)
+        r.receipt_date,r.vendor,Number(r.amount),r.category_id||null,ext,r.payment_method,r.payment_reference||null,false
       ]);
     const tid=tr.rows[0]?.id||((await pool.query("SELECT id FROM transactions WHERE external_id=$1 LIMIT 1",[ext])).rows[0]?.id||null);
     if(tid){
@@ -723,7 +753,7 @@ app.post("/api/receipts",upload.any(),async(req,res,next)=>{try{
         const chosenCategory=Number.isFinite(cat)?cat:(existing.category_id||null);
         const ext=crypto.createHash("sha256").update([useDate,paymentMethod,paymentReference||"",String(useVendor).toUpperCase(),Number(useAmount).toFixed(2)].join("|")).digest("hex");
         const tr=await pool.query(`INSERT INTO transactions(transaction_date,posted_date,vendor_raw,vendor_normalized,amount,category_id,card_id,source,external_id,status,payment_method,payment_reference,captain_reviewed)
-          VALUES($1,$1,$2,$2,$3,$4,NULL,'manual',$5,'posted',$6,$7,$8) ON CONFLICT DO NOTHING RETURNING id`,[useDate,useVendor,useAmount,chosenCategory,ext,paymentMethod,paymentReference,Boolean(chosenCategory)]);
+          VALUES($1,$1,$2,$2,$3,$4,NULL,'manual',$5,'posted',$6,$7,$8) ON CONFLICT DO NOTHING RETURNING id`,[useDate,useVendor,useAmount,chosenCategory,ext,paymentMethod,paymentReference,Number.isFinite(cat)]);
         const newTid=tr.rows[0]?.id||((await pool.query("SELECT id FROM transactions WHERE external_id=$1 LIMIT 1",[ext])).rows[0]?.id||null);
         if(newTid){
           await pool.query("UPDATE receipts SET transaction_id=$1,receipt_date=COALESCE(receipt_date,$2),vendor=COALESCE(vendor,$3),amount=COALESCE(amount,$4),category_id=COALESCE(category_id,$5),receipt_text=COALESCE(receipt_text,$6),review_required=false WHERE id=$7",[newTid,useDate,useVendor,useAmount,chosenCategory,receiptText,existing.id]);
@@ -748,12 +778,13 @@ app.post("/api/receipts",upload.any(),async(req,res,next)=>{try{
   }
   if(!Number.isFinite(tid) && paymentMethod!=="credit_card"){
     if(!date||!vendor||amount===null)return res.status(400).json({error:"Date, vendor, and amount are required for wire, check, or cash expenses"});
+    await assertMonthOpen(date);
     const rule=(await pool.query("SELECT category_id FROM vendor_rules WHERE $1 ILIKE '%'||vendor_pattern||'%' ORDER BY length(vendor_pattern) DESC LIMIT 1",[vendor])).rows[0];
     const chosenCategory=inferredCat||rule?.category_id||null;
     const ext=crypto.createHash("sha256").update([date,paymentMethod,paymentReference||"",vendor.toUpperCase(),amount.toFixed(2)].join("|")).digest("hex");
     const tr=await pool.query(`INSERT INTO transactions(transaction_date,posted_date,vendor_raw,vendor_normalized,amount,category_id,card_id,notes,source,external_id,status,payment_method,payment_reference,captain_reviewed)
       VALUES($1,$1,$2,$2,$3,$4,NULL,NULL,'manual',$5,'posted',$6,$7,$8)
-      ON CONFLICT DO NOTHING RETURNING id`,[date,vendor,amount,chosenCategory,ext,paymentMethod,paymentReference,Boolean(chosenCategory)]);
+      ON CONFLICT DO NOTHING RETURNING id`,[date,vendor,amount,chosenCategory,ext,paymentMethod,paymentReference,Number.isFinite(cat)]);
     tid=tr.rows[0]?.id||((await pool.query("SELECT id FROM transactions WHERE external_id=$1 LIMIT 1",[ext])).rows[0]?.id||null);
   }
   const q=await pool.query(`INSERT INTO receipts(transaction_id,file_name,content_type,file_size,file_data,receipt_date,vendor,amount,category_id,file_sha256,receipt_text,expires_at,payment_method,payment_reference,review_required)
@@ -796,13 +827,14 @@ app.patch("/api/receipts/:id",async(req,res,next)=>{try{
   let createdTransactionId=null,matched=null;
   if(!current.transaction_id && paymentMethod!=="credit_card"){
     if(!date||!vendor||amount===null)return res.status(400).json({error:"Date, vendor, and amount are required for cash, check, or wire"});
+    await assertMonthOpen(date);
     const rule=(await pool.query("SELECT category_id FROM vendor_rules WHERE $1 ILIKE '%'||vendor_pattern||'%' ORDER BY length(vendor_pattern) DESC LIMIT 1",[vendor])).rows[0];
     const chosenCategory=categoryId||rule?.category_id||null;
     const ext=crypto.createHash("sha256").update(["receipt-correction",id,String(date).slice(0,10),paymentMethod,paymentReference||"",vendor.toUpperCase(),Number(amount).toFixed(2)].join("|")).digest("hex");
     const tr=await pool.query(`INSERT INTO transactions(transaction_date,posted_date,vendor_raw,vendor_normalized,amount,category_id,card_id,source,external_id,status,payment_method,payment_reference,captain_reviewed)
       VALUES($1,$1,$2,$2,$3,$4,NULL,'receipt-correction',$5,'posted',$6,$7,$8)
       ON CONFLICT(external_id) WHERE external_id IS NOT NULL DO NOTHING RETURNING id`,
-      [date,vendor,amount,chosenCategory,ext,paymentMethod,paymentReference,Boolean(chosenCategory)]);
+      [date,vendor,amount,chosenCategory,ext,paymentMethod,paymentReference,b.category_id!==undefined&&b.category_id!==null]);
     createdTransactionId=tr.rows[0]?.id||((await pool.query("SELECT id FROM transactions WHERE external_id=$1 LIMIT 1",[ext])).rows[0]?.id||null);
     if(createdTransactionId)await pool.query("UPDATE receipts SET transaction_id=$1,category_id=COALESCE(category_id,$2) WHERE id=$3",[createdTransactionId,chosenCategory,id]);
   }else if(!current.transaction_id && paymentMethod==="credit_card"){
@@ -836,6 +868,7 @@ app.post("/api/receipts/:id/match",async(req,res,next)=>{try{
   if(taken)return res.status(409).json({error:"That transaction already has a receipt attached"});
   await pool.query("UPDATE receipts SET transaction_id=$1,match_method='manual',match_score=NULL,matched_at=NOW(),matched_by='captain' WHERE id=$2",[transactionId,receiptId]);
   if(r.category_id)await pool.query("UPDATE transactions SET category_id=COALESCE(category_id,$1),captain_reviewed=true,updated_at=NOW() WHERE id=$2",[r.category_id,transactionId]);
+  await audit("captain","manual_match","receipt",receiptId,{transaction_id:null},{transaction_id:transactionId},{source:"POST /api/receipts/:id/match"});
   res.json({ok:true});
 }catch(e){next(e)}});
 
@@ -846,6 +879,16 @@ app.get("/api/receipts/:id",async(req,res,next)=>{try{
   res.type(r.content_type);res.set("Content-Disposition",`inline; filename="${String(r.file_name).replaceAll('"','')}"`);res.send(r.file_data)
 }catch(e){next(e)}});
 
+
+app.get("/api/audit-log",async(req,res,next)=>{try{
+  const entityType=req.query.entity_type||null,entityId=req.query.entity_id||null;
+  const limit=Math.min(500,Math.max(1,Number(req.query.limit)||100));
+  const q=await pool.query(
+    `SELECT id,created_at,actor,action,entity_type,entity_id,old_data,new_data,reason,source FROM audit_log
+     WHERE ($1::text IS NULL OR entity_type=$1) AND ($2::text IS NULL OR entity_id=$2)
+     ORDER BY id DESC LIMIT $3`,[entityType,entityId,limit]);
+  res.json({rows:q.rows});
+}catch(e){next(e)}});
 
 app.get("/api/report",async(req,res,next)=>{try{
   const scope=["month","quarter","year"].includes(req.query.scope)?req.query.scope:"month";
@@ -874,7 +917,19 @@ app.post("/api/close-month",async(req,res,next)=>{try{
   if(c.uncategorized||c.missing_receipts||c.unreviewed||c.suspected_duplicates||u)return res.status(409).json({closed:false,blockers:{...c,unmatched_receipts:u}});
   await pool.query(`INSERT INTO month_closes(month_start,calculated_total,closed,closed_at) VALUES($1,$2,true,NOW())
     ON CONFLICT(month_start) DO UPDATE SET calculated_total=EXCLUDED.calculated_total,closed=true,closed_at=NOW()`,[start,Number(c.total)]);
+  await audit("captain","month_close","month",month,null,{calculated_total:Number(c.total)},{source:"POST /api/close-month"});
   res.json({closed:true,month})
+}catch(e){next(e)}});
+
+app.post("/api/reopen-month",async(req,res,next)=>{try{
+  const {month,start}=monthBounds(req.body.month);
+  const reason=String(req.body.reason||"").trim();
+  if(!reason)return res.status(400).json({error:"A reason is required to reopen a closed month"});
+  const existing=(await pool.query("SELECT closed FROM month_closes WHERE month_start=$1",[start])).rows[0];
+  if(!existing?.closed)return res.status(400).json({error:"That month is not closed"});
+  await pool.query("UPDATE month_closes SET closed=false,closed_at=NULL WHERE month_start=$1",[start]);
+  await audit("captain","month_reopen","month",month,{closed:true},{closed:false},{reason,source:"POST /api/reopen-month"});
+  res.json({closed:false,month});
 }catch(e){next(e)}});
 
 app.use((err,_req,res,_next)=>{console.error(err);if(err.code==="LIMIT_FILE_SIZE")return res.status(413).json({error:"Receipt must be under 20MB per image"});if(err.statusCode)return res.status(err.statusCode).json({error:err.message});res.status(500).json({error:"Server error"})});
