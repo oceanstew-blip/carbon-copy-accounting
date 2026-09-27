@@ -833,3 +833,5 @@ if(maintenanceFlag){
 }
 
 app.listen(port,"0.0.0.0",()=>console.log(`Carbon Copy Accounting listening on ${port}`));
+
+export {app,pool,init};

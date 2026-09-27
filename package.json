@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "start": "node server.js",
+    "test": "bash tests/run.sh",
     "maintenance:legacy-cleanup": "node server.js --legacy-cleanup",
     "maintenance:seed-once": "node server.js --seed-once",
     "maintenance:purge-expired": "node server.js --purge-expired"
