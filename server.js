@@ -79,7 +79,7 @@ function loginPage({error}={}){
 function auth(req,res,next){
   const user=process.env.APP_USERNAME,pass=process.env.APP_PASSWORD;
   if(!user||!pass)return next();
-  if(req.path==="/login"||req.path.startsWith("/assets/"))return next();
+  if(req.path==="/login"||req.path.startsWith("/assets/")||req.path.startsWith("/.well-known/"))return next();
   const cookies=parseCookies(req);
   if(verifySession(cookies.ccc_session,user))return next();
   // Basic Auth still works for API clients/scripts (e.g. the test suite) that

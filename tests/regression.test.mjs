@@ -610,6 +610,14 @@ test("Basic Auth still works for API clients that skip the login page", async ()
   assert.equal(res.status, 200);
 });
 
+test("ACME/domain-verification challenge path is reachable without auth", async () => {
+  // Custom-domain SSL issuance needs an unauthenticated GET here to succeed.
+  // Regression: the login middleware once blanket-401'd every path except
+  // /login and /assets/, silently breaking domain verification.
+  const res = await fetch(BASE + "/.well-known/acme-challenge/test-token");
+  assert.notEqual(res.status, 401);
+});
+
 // ---- Runner ----
 
 async function run() {
