@@ -3,6 +3,7 @@ import multer from "multer";
 import pg from "pg";
 import crypto from "crypto";
 import sharp from "sharp";
+import { promises as fsp } from "fs";
 import { createWorker, PSM } from "tesseract.js";
 import { capitalOneCsv, initialRules, driveReceipts } from "./seed.js";
 
@@ -485,14 +486,12 @@ app.get("/health",(_req,res)=>res.json({ok:true}));
 app.get("/api/ocr/status",(_req,res)=>res.json({enabled:true,mode:"server-side",engine:"tesseract",formats:["JPG","PNG","WEBP","HEIC","HEIF"],manual_fallback:true}));
 
 app.get("/api/ocr/self-test",async(_req,res,next)=>{try{
-  const svg=Buffer.from(`<svg width="1200" height="700" xmlns="http://www.w3.org/2000/svg">
-    <rect width="100%" height="100%" fill="white"/>
-    <text x="80" y="130" font-family="DejaVu Sans, Liberation Sans, sans-serif" font-size="58" fill="black">HARBOR MARINE SUPPLY</text>
-    <text x="80" y="240" font-family="DejaVu Sans, Liberation Sans, sans-serif" font-size="48" fill="black">09/26/2026</text>
-    <text x="80" y="350" font-family="DejaVu Sans, Liberation Sans, sans-serif" font-size="42" fill="black">Bilge pump hose and stainless clamps</text>
-    <text x="80" y="470" font-family="DejaVu Sans, Liberation Sans, sans-serif" font-size="54" fill="black">TOTAL $87.46</text>
-  </svg>`);
-  const png=await sharp(svg).png().toBuffer();
+  // ponytail: this used to render its own SVG-with-text at request time, which
+  // depends on the host having a matching font installed — worked on macOS,
+  // silently produced blank/garbled text on Railway's container. Using a PNG
+  // fixture rendered once (on a machine with real fonts) removes that host
+  // dependency entirely.
+  const png=await fsp.readFile(new URL("./tests/fixtures/ocr-self-test-receipt.png",import.meta.url));
   const data=await ocrImage(png);
   const vendorOk=/HARBOR|MARINE|SUPPLY/i.test(data.vendor||data.receipt_text||"");
   const amountOk=Math.abs(Number(data.amount)-87.46)<0.02;
