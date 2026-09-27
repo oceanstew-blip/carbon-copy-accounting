@@ -561,6 +561,55 @@ test("petty cash: counting an actual balance shows the difference from expected"
   assert.equal(body.difference, -50);
 });
 
+// ---- Login page (cookie-session auth) ----
+
+test("unauthenticated browser visit redirects to /login, not a bare 401", async () => {
+  const res = await fetch(BASE + "/", { headers: { Accept: "text/html" }, redirect: "manual" });
+  assert.equal(res.status, 302);
+  assert.equal(res.headers.get("location"), "/login");
+});
+
+test("/login page renders without auth", async () => {
+  const res = await fetch(BASE + "/login");
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.match(html, /Sign in/);
+  assert.match(html, /M\/Y CARBON COPY/);
+});
+
+test("wrong password on /login shows an error, no cookie set", async () => {
+  const res = await fetch(BASE + "/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: "username=test&password=wrong",
+    redirect: "manual",
+  });
+  assert.equal(res.status, 401);
+  assert.equal(res.headers.get("set-cookie"), null);
+  assert.match(await res.text(), /Incorrect username or password/);
+});
+
+test("correct login sets a session cookie that authenticates subsequent requests", async () => {
+  const res = await fetch(BASE + "/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: "username=test&password=test",
+    redirect: "manual",
+  });
+  assert.equal(res.status, 302);
+  assert.equal(res.headers.get("location"), "/");
+  const cookie = res.headers.get("set-cookie");
+  assert.match(cookie, /^ccc_session=/);
+  const sessionCookie = cookie.split(";")[0];
+  const authed = await fetch(BASE + "/api/bootstrap", { headers: { Cookie: sessionCookie } });
+  assert.equal(authed.status, 200);
+});
+
+test("Basic Auth still works for API clients that skip the login page", async () => {
+  const res = await apiFetch("/api/bootstrap");
+  assert.equal(res.status, 200);
+});
+
 // ---- Runner ----
 
 async function run() {

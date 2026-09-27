@@ -9,20 +9,101 @@ import { capitalOneCsv, initialRules, driveReceipts } from "./seed.js";
 
 const {Pool}=pg;
 const app=express();
+app.set("trust proxy",1);
 const port=process.env.PORT||3000;
 const pool=new Pool({connectionString:process.env.DATABASE_URL});
 const upload=multer({storage:multer.memoryStorage(),limits:{fileSize:20*1024*1024}});
 
+const SESSION_MAX_AGE_MS=90*24*60*60*1000;
+function sessionSecret(){return process.env.SESSION_SECRET||process.env.APP_PASSWORD||"carbon-copy-dev-secret"}
+function signSession(username){
+  const expires=Date.now()+SESSION_MAX_AGE_MS;
+  const payload=`${username}.${expires}`;
+  const sig=crypto.createHmac("sha256",sessionSecret()).update(payload).digest("hex");
+  return `${payload}.${sig}`;
+}
+function verifySession(token,expectedUser){
+  if(!token)return false;
+  const parts=String(token).split(".");
+  if(parts.length!==3)return false;
+  const [username,expires,sig]=parts;
+  const expected=crypto.createHmac("sha256",sessionSecret()).update(`${username}.${expires}`).digest("hex");
+  if(sig.length!==expected.length||!crypto.timingSafeEqual(Buffer.from(sig),Buffer.from(expected)))return false;
+  if(Date.now()>Number(expires))return false;
+  return username===expectedUser;
+}
+function parseCookies(req){
+  const out={};
+  for(const part of String(req.headers.cookie||"").split(";")){
+    const i=part.indexOf("=");if(i<0)continue;
+    out[part.slice(0,i).trim()]=decodeURIComponent(part.slice(i+1).trim());
+  }
+  return out;
+}
+function loginPage({error}={}){
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Carbon Copy Accounting — Sign in</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=Fraunces:opsz,wght@9..144,600&display=swap');
+    *{box-sizing:border-box}
+    body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+      font-family:'IBM Plex Sans',ui-sans-serif,sans-serif;
+      background:linear-gradient(125deg,#061e30 0%,#0c3450 30%,#1b5a82 62%,#2f7fac 88%,#4ba0c9 100%);}
+    .card{width:100%;max-width:380px;background:#fff;border:1.5px solid #c7d4d8;padding:36px 32px;margin:20px}
+    .yacht{width:100%;height:120px;overflow:hidden;border:2px solid #0c3450;margin-bottom:20px}
+    .yacht img{width:100%;height:100%;object-fit:cover;object-position:center 42%;display:block}
+    .eyebrow{font:600 11px/1 'IBM Plex Mono',monospace;letter-spacing:.24em;color:#5c7278;margin-bottom:6px}
+    h1{margin:0 0 24px;font-family:'Fraunces',serif;font-size:28px;font-weight:600;color:#16333c}
+    label{display:block;font:600 11px 'IBM Plex Mono',monospace;letter-spacing:.08em;text-transform:uppercase;color:#5c7278;margin-bottom:6px}
+    input{width:100%;border:1.5px solid #c7d4d8;padding:11px 12px;font:15px 'IBM Plex Sans',sans-serif;margin-bottom:16px;color:#16333c}
+    input:focus{outline:2px solid #2f7fac;outline-offset:1px}
+    button{width:100%;background:#1b5a82;border:none;color:#fff;font:700 13px 'IBM Plex Mono',monospace;letter-spacing:.06em;text-transform:uppercase;padding:14px;cursor:pointer}
+    button:hover{background:#0c3450}
+    .error{background:#fbe6e4;border:1px solid #e2a8a4;color:#b3312c;padding:10px 12px;font-size:13px;margin-bottom:16px}
+  </style></head><body>
+  <form class="card" method="post" action="/login">
+    <div class="yacht"><img src="/assets/yacht.jpg" alt="M/Y Carbon Copy"></div>
+    <div class="eyebrow">M/Y CARBON COPY</div>
+    <h1>Accounting</h1>
+    ${error?`<div class="error">${error}</div>`:""}
+    <label for="u">Username</label>
+    <input id="u" name="username" autocomplete="username" autofocus>
+    <label for="p">Password</label>
+    <input id="p" name="password" type="password" autocomplete="current-password">
+    <button type="submit">Sign in</button>
+  </form>
+  </body></html>`;
+}
 function auth(req,res,next){
   const user=process.env.APP_USERNAME,pass=process.env.APP_PASSWORD;
   if(!user||!pass)return next();
+  if(req.path==="/login"||req.path.startsWith("/assets/"))return next();
+  const cookies=parseCookies(req);
+  if(verifySession(cookies.ccc_session,user))return next();
+  // Basic Auth still works for API clients/scripts (e.g. the test suite) that
+  // don't want the cookie-session login flow built for the browser UI.
   const h=req.headers.authorization||"";
-  if(!h.startsWith("Basic ")){res.set("WWW-Authenticate",'Basic realm="Carbon Copy Accounting"');return res.status(401).send("Login required")}
-  const [u,p]=Buffer.from(h.slice(6),"base64").toString().split(":");
-  if(u!==user||p!==pass){res.set("WWW-Authenticate",'Basic realm="Carbon Copy Accounting"');return res.status(401).send("Invalid login")}
-  next();
+  if(h.startsWith("Basic ")){
+    const [u,p]=Buffer.from(h.slice(6),"base64").toString().split(":");
+    if(u===user&&p===pass)return next();
+  }
+  if(req.method==="GET"&&(req.headers.accept||"").includes("text/html"))return res.redirect("/login");
+  res.status(401).json({error:"Login required"});
 }
 app.use(auth);
+app.use(express.urlencoded({extended:false}));
+app.get("/login",(_req,res)=>res.type("html").send(loginPage()));
+app.post("/login",(req,res)=>{
+  const user=process.env.APP_USERNAME,pass=process.env.APP_PASSWORD;
+  const {username,password}=req.body||{};
+  if(username!==user||password!==pass)return res.status(401).type("html").send(loginPage({error:"Incorrect username or password."}));
+  const token=signSession(user);
+  res.cookie("ccc_session",token,{httpOnly:true,secure:req.secure,sameSite:"lax",maxAge:SESSION_MAX_AGE_MS});
+  res.redirect("/");
+});
+app.get("/logout",(req,res)=>{
+  res.clearCookie("ccc_session",{httpOnly:true,secure:req.secure,sameSite:"lax"});
+  res.redirect("/login");
+});
 app.use(express.json({limit:"8mb"}));
 app.use(express.static("public"));
 
