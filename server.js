@@ -375,10 +375,29 @@ async function assertMonthOpen(dateVal){
   const closed=(await pool.query("SELECT closed FROM month_closes WHERE month_start=$1",[monthStart])).rows[0]?.closed;
   if(closed){const e=new Error(`${iso.slice(0,7)} is closed. Reopen the month before making this change.`);e.statusCode=409;throw e}
 }
+// Owner approval on this boat happens before the captain makes the purchase, not
+// after it posts — so a large transaction isn't an open decision, it's a record
+// of a decision already made. Threshold defaults to $1,000 (captain-set 9/27)
+// and marks straight to "approved" rather than "needed" so it doesn't sit on the
+// dashboard or alert digest as something still awaiting a decision.
 async function approvalStatusFor(amount){
   const row=(await pool.query("SELECT value FROM settings WHERE key='owner_approval_threshold'")).rows[0];
-  const threshold=row?Number(row.value):null;
-  return Number.isFinite(threshold)&&Math.abs(Number(amount))>=threshold?"needed":"not_required";
+  // No row at all -> default $1,000. A row with value=null is the PUT endpoint's
+  // documented way to disable the threshold entirely -- must stay null, not
+  // collapse to Number(null)===0 (which would flag every non-zero charge).
+  const threshold=row?row.value===null?null:Number(row.value):1000;
+  return threshold!==null&&Number.isFinite(threshold)&&Math.abs(Number(amount))>threshold?"approved":"not_required";
+}
+// High-frequency vendors (Amazon, Publix, etc.) legitimately post more than one
+// same-day, same-amount charge — two Amazon orders that both round to $24.99,
+// two identical Publix provisioning runs. Fingerprint matching alone can't tell
+// that apart from a real double-charge, so these vendors are exempt from the
+// suspected-duplicate flag. Captain-editable via settings key
+// 'duplicate_exempt_vendors' (JSON array of substrings, case-insensitive).
+async function duplicateExemptVendorPatterns(){
+  const row=(await pool.query("SELECT value FROM settings WHERE key='duplicate_exempt_vendors'")).rows[0];
+  const list=row?row.value:["AMAZON","PUBLIX"];
+  return (Array.isArray(list)?list:[]).map(s=>String(s).trim().toUpperCase()).filter(Boolean);
 }
 function fingerprint(r){
   return crypto.createHash("sha256").update([
@@ -671,6 +690,7 @@ app.post("/api/transactions",async(req,res,next)=>{try{
     batchId=batch.rows[0].id;
   }
 
+  const exemptVendors=await duplicateExemptVendorPatterns();
   let inserted=0,skipped=0,suspected=0,blockedClosedMonth=0;
   for(let i=0;i<rows.length;i++){
     const x=rows[i];
@@ -704,10 +724,11 @@ app.post("/api/transactions",async(req,res,next)=>{try{
     // re-import, or two legitimately identical charges (same vendor/amount/day).
     // Never drop it silently; insert it flagged for review instead.
     const already=(await pool.query("SELECT COUNT(*)::int c FROM transactions WHERE external_id LIKE $1",[fp+"%"])).rows[0].c;
+    const exempt=exemptVendors.some((v)=>r.vendor_raw.toUpperCase().includes(v));
     const extId=already?`${fp}#${already}`:fp;
-    await pool.query(insertSql,insertArgs(extId,already?"suspected":"none"));
+    await pool.query(insertSql,insertArgs(extId,already&&!exempt?"suspected":"none"));
     inserted++;
-    if(already)suspected++;
+    if(already&&!exempt)suspected++;
   }
   const matched=await matchAllReceipts();
   res.status(201).json({inserted,skipped,suspected_duplicates:suspected,blocked_closed_month:blockedClosedMonth,receipts_matched:matched,batch_id:batchId})

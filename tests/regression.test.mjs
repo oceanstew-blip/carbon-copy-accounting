@@ -148,6 +148,17 @@ test("legitimate repeated identical-looking charges are not silently discarded (
   assert.deepEqual(rows.map((r) => r.duplicate_status).sort(), ["none", "suspected"]);
 });
 
+test("high-frequency vendors (Amazon, Publix) are exempt from the suspected-duplicate flag", async () => {
+  const base = { transaction_date: "2026-09-14", vendor_raw: "AMAZON MKTPL*" + crypto.randomUUID().slice(0, 8), amount: 24.99 };
+  const res = await apiFetch("/api/transactions", { method: "POST", body: JSON.stringify({ rows: [base, base] }) });
+  const body = await res.json();
+  assert.equal(body.inserted, 2);
+  assert.equal(body.suspected_duplicates, 0, "two same-day, same-amount Amazon charges are normal, not suspicious");
+  const list = await (await apiFetch(`/api/transactions?month=2026-09`)).json();
+  const rows = list.rows.filter((r) => r.vendor_raw === base.vendor_raw);
+  assert.deepEqual(rows.map((r) => r.duplicate_status), ["none", "none"]);
+});
+
 test("uploading the same statement file twice is a safe no-op", async () => {
   const hash = "test-file-hash-" + crypto.randomUUID();
   const payload = { file_hash: hash, source_filename: "test.csv", rows: [
@@ -409,7 +420,10 @@ test("closed month blocks editing an existing transaction, and reopening require
 
 // ---- Owner approval thresholds (Priority 11) ----
 
-test("transactions above the configured threshold need approval; below it, they don't", async () => {
+// Owner approval on this boat happens before the charge, not after — so a
+// transaction over threshold is a record of a decision already made, not an
+// open one. It lands as "approved" directly, never sits as "needed".
+test("transactions above the configured threshold record as already-approved; below it, no approval is required", async () => {
   const setRes = await apiFetch("/api/settings/owner-approval-threshold", { method: "PUT", body: JSON.stringify({ value: 1000 }) });
   assert.equal(setRes.status, 200);
   const tag = crypto.randomUUID();
@@ -421,13 +435,16 @@ test("transactions above the configured threshold need approval; below it, they 
     ] }),
   });
   const list = await (await apiFetch("/api/transactions?month=2026-09")).json();
-  assert.equal(list.rows.find((r) => r.vendor_raw === "Big Spend " + tag).approval_status, "needed");
+  assert.equal(list.rows.find((r) => r.vendor_raw === "Big Spend " + tag).approval_status, "approved");
   assert.equal(list.rows.find((r) => r.vendor_raw === "Small Spend " + tag).approval_status, "not_required");
   await apiFetch("/api/settings/owner-approval-threshold", { method: "PUT", body: JSON.stringify({ value: null }) });
 });
 
-test("captain can approve a flagged transaction, which then unblocks month close", async () => {
-  await apiFetch("/api/settings/owner-approval-threshold", { method: "PUT", body: JSON.stringify({ value: 200 }) });
+// A captain can still hand-flag a transaction as "needed" (e.g. a genuine
+// emergency purchase made without prior owner sign-off) and later approve it,
+// which unblocks month close — the manual override path stays available even
+// though the threshold no longer sets "needed" automatically.
+test("captain can manually flag then approve a transaction, which unblocks month close", async () => {
   const boot = await (await apiFetch("/api/bootstrap")).json();
   const month = "2026-04";
   await apiFetch("/api/transactions", {
@@ -436,8 +453,9 @@ test("captain can approve a flagged transaction, which then unblocks month close
   });
   const list = await (await apiFetch(`/api/transactions?month=${month}`)).json();
   const tx = list.rows.find((r) => r.vendor_raw === "Approval Flow Vendor");
-  assert.equal(tx.approval_status, "needed");
+  assert.equal(tx.approval_status, "not_required");
 
+  await apiFetch(`/api/transactions/${tx.id}`, { method: "PATCH", body: JSON.stringify({ approval_status: "needed" }) });
   const closeBlocked = await apiFetch("/api/close-month", { method: "POST", body: JSON.stringify({ month }) });
   const blockedBody = await closeBlocked.json();
   assert.equal(closeBlocked.status, 409);
@@ -452,7 +470,6 @@ test("captain can approve a flagged transaction, which then unblocks month close
   assert.equal(updated.approval_status, "approved");
   assert.equal(updated.approved_by, "captain");
   assert.ok(updated.approval_date);
-  await apiFetch("/api/settings/owner-approval-threshold", { method: "PUT", body: JSON.stringify({ value: null }) });
 });
 
 // ---- Capital One reconciliation (Priority 9) ----
