@@ -362,6 +362,10 @@ async function init(){
       entity_type TEXT NOT NULL,entity_id TEXT,old_data JSONB,new_data JSONB,reason TEXT,source TEXT);
     CREATE INDEX IF NOT EXISTS audit_log_entity_idx ON audit_log(entity_type,entity_id);
     CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value JSONB);
+    CREATE TABLE IF NOT EXISTS petty_cash_periods(
+      month_start DATE PRIMARY KEY,beginning_balance NUMERIC(12,2) NOT NULL DEFAULT 0,
+      replenishments NUMERIC(12,2) NOT NULL DEFAULT 0,counted_balance NUMERIC(12,2),
+      counted_at TIMESTAMPTZ,notes TEXT);
     ALTER TABLE transactions ADD COLUMN IF NOT EXISTS approval_status TEXT NOT NULL DEFAULT 'not_required'
       CHECK(approval_status IN('not_required','needed','approved','declined','emergency_approved'));
     ALTER TABLE transactions ADD COLUMN IF NOT EXISTS approval_date TIMESTAMPTZ;
@@ -934,6 +938,47 @@ function csvCell(v){
   const s=String(v);
   return /[",\n]/.test(s)?`"${s.replaceAll('"','""')}"`:s;
 }
+app.get("/api/petty-cash",async(req,res,next)=>{try{
+  const {month,start,next:n}=monthBounds(req.query.month);
+  const period=(await pool.query("SELECT * FROM petty_cash_periods WHERE month_start=$1",[start])).rows[0]
+    ||{month_start:start,beginning_balance:0,replenishments:0,counted_balance:null,counted_at:null,notes:null};
+  const cashExpenses=(await pool.query(`SELECT COALESCE(SUM(t.amount),0)::numeric total,COUNT(*)::int count,
+      COUNT(*) FILTER(WHERE r.id IS NULL)::int missing_receipts
+    FROM transactions t LEFT JOIN receipts r ON r.transaction_id=t.id
+    WHERE t.payment_method='cash' AND t.status='posted' AND t.transaction_date>=$1::date AND t.transaction_date<$2::date`,[start,n])).rows[0];
+  const expectedEnding=Number(period.beginning_balance)+Number(period.replenishments)-Number(cashExpenses.total);
+  res.json({
+    month,beginning_balance:Number(period.beginning_balance),replenishments:Number(period.replenishments),
+    cash_expenses_total:Number(cashExpenses.total),cash_expense_count:cashExpenses.count,cash_expenses_missing_receipts:cashExpenses.missing_receipts,
+    expected_ending_balance:Math.round(expectedEnding*100)/100,
+    counted_balance:period.counted_balance==null?null:Number(period.counted_balance),
+    difference:period.counted_balance==null?null:Math.round((Number(period.counted_balance)-expectedEnding)*100)/100,
+    counted_at:period.counted_at,notes:period.notes
+  });
+}catch(e){next(e)}});
+
+app.put("/api/petty-cash",async(req,res,next)=>{try{
+  const {month,start}=monthBounds(req.body.month);
+  const beginningBalance=moneyNum(req.body.beginning_balance),replenishments=moneyNum(req.body.replenishments)??0,
+    countedBalance=req.body.counted_balance===undefined||req.body.counted_balance===null?null:moneyNum(req.body.counted_balance);
+  if(beginningBalance===null)return res.status(400).json({error:"beginning_balance is required"});
+  const before=(await pool.query("SELECT * FROM petty_cash_periods WHERE month_start=$1",[start])).rows[0]||null;
+  await pool.query(`INSERT INTO petty_cash_periods(month_start,beginning_balance,replenishments,counted_balance,counted_at,notes)
+    VALUES($1,$2,$3,$4,$5,$6)
+    ON CONFLICT(month_start) DO UPDATE SET beginning_balance=EXCLUDED.beginning_balance,replenishments=EXCLUDED.replenishments,
+      counted_balance=EXCLUDED.counted_balance,counted_at=EXCLUDED.counted_at,notes=EXCLUDED.notes`,
+    [start,beginningBalance,replenishments,countedBalance,countedBalance===null?null:new Date(),req.body.notes||null]);
+  await audit("captain","update","petty_cash_period",month,before,{beginning_balance:beginningBalance,replenishments,counted_balance:countedBalance},{source:"PUT /api/petty-cash"});
+  const cashExpenses=(await pool.query(`SELECT COALESCE(SUM(amount),0)::numeric total FROM transactions
+    WHERE payment_method='cash' AND status='posted' AND transaction_date>=$1::date AND transaction_date<(($1::date)+INTERVAL '1 month')`,[start])).rows[0];
+  const expectedEnding=beginningBalance+replenishments-Number(cashExpenses.total);
+  res.json({
+    month,beginning_balance:beginningBalance,replenishments,cash_expenses_total:Number(cashExpenses.total),
+    expected_ending_balance:Math.round(expectedEnding*100)/100,counted_balance:countedBalance,
+    difference:countedBalance===null?null:Math.round((countedBalance-expectedEnding)*100)/100
+  });
+}catch(e){next(e)}});
+
 app.get("/api/import-batches",async(_req,res,next)=>{try{
   const q=await pool.query(`SELECT id,source_filename,file_hash,uploaded_at,statement_start,statement_end,row_count,
     beginning_balance,ending_balance,reconciled,reconciled_at FROM import_batches ORDER BY uploaded_at DESC LIMIT 50`);

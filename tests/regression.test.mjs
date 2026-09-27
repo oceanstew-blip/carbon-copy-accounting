@@ -531,6 +531,36 @@ test("exception report lists uncategorized and unreviewed transactions", async (
   assert.ok(body.unreviewed.some((r) => r.vendor_raw === "Exception Test Vendor " + tag));
 });
 
+// ---- Petty cash (Priority 10) ----
+
+test("petty cash: expected ending balance = beginning + replenishments - cash expenses", async () => {
+  const month = "2026-03";
+  const tag = crypto.randomUUID();
+  await apiFetch("/api/transactions", {
+    method: "POST",
+    body: JSON.stringify({ transaction_date: `${month}-10`, vendor_raw: "Petty Cash Test " + tag, amount: 40, payment_method: "cash", external_id: "test-pettycash-" + tag }),
+  });
+  const setRes = await apiFetch("/api/petty-cash", { method: "PUT", body: JSON.stringify({ month, beginning_balance: 500, replenishments: 100 }) });
+  const setBody = await setRes.json();
+  // 500 + 100 replenishment - at least the 40 we just posted (plus whatever else is in this seeded month)
+  assert.ok(setBody.expected_ending_balance <= 560);
+
+  const get = await (await apiFetch(`/api/petty-cash?month=${month}`)).json();
+  assert.equal(get.beginning_balance, 500);
+  assert.equal(get.replenishments, 100);
+  assert.equal(get.counted_balance, null);
+  assert.equal(get.difference, null);
+});
+
+test("petty cash: counting an actual balance shows the difference from expected", async () => {
+  const month = "2026-02";
+  const countRes = await apiFetch("/api/petty-cash", { method: "PUT", body: JSON.stringify({ month, beginning_balance: 300, replenishments: 0, counted_balance: 250 }) });
+  const body = await countRes.json();
+  assert.equal(body.expected_ending_balance, 300);
+  assert.equal(body.counted_balance, 250);
+  assert.equal(body.difference, -50);
+});
+
 // ---- Runner ----
 
 async function run() {
