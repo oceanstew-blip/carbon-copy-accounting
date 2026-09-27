@@ -455,6 +455,82 @@ test("captain can approve a flagged transaction, which then unblocks month close
   await apiFetch("/api/settings/owner-approval-threshold", { method: "PUT", body: JSON.stringify({ value: null }) });
 });
 
+// ---- Capital One reconciliation (Priority 9) ----
+
+test("reconciliation: imported batch totals are computed, and matching balances mark it reconciled", async () => {
+  const tag = crypto.randomUUID();
+  const hash = "recon-hash-" + tag;
+  const importRes = await apiFetch("/api/transactions", {
+    method: "POST",
+    body: JSON.stringify({
+      file_hash: hash, source_filename: "recon-test.csv",
+      rows: [
+        { transaction_date: "2026-06-01", vendor_raw: "Recon Charge " + tag, amount: 100 },
+        { transaction_date: "2026-06-02", vendor_raw: "Recon Refund " + tag, amount: -20 },
+      ],
+    }),
+  });
+  const importBody = await importRes.json();
+  const batchId = importBody.batch_id;
+  assert.ok(batchId);
+
+  const before = await (await apiFetch(`/api/reconciliation/${batchId}`)).json();
+  assert.equal(before.imported_row_count, 2);
+  assert.equal(Number(before.imported_charge_total), 100);
+  assert.equal(Number(before.imported_credit_total), -20);
+  assert.equal(before.reconciliation_status, "needs_balances");
+
+  // beginning 1000 + charges 100 + credits -20 = expected ending 1080
+  const putRes = await apiFetch(`/api/reconciliation/${batchId}`, { method: "PUT", body: JSON.stringify({ beginning_balance: 1000, ending_balance: 1080 }) });
+  const putBody = await putRes.json();
+  assert.equal(putBody.reconciliation_difference, 0);
+  // won't be "reconciled" yet since the imported transactions have no receipts/categories,
+  // which is correct per the brief: exceptions must be resolved first, not just the math.
+  assert.equal(putBody.reconciled, false);
+});
+
+test("reconciliation: mismatched ending balance is flagged, not silently accepted", async () => {
+  const tag = crypto.randomUUID();
+  const importRes = await apiFetch("/api/transactions", {
+    method: "POST",
+    body: JSON.stringify({ file_hash: "recon-mismatch-" + tag, source_filename: "mismatch.csv",
+      rows: [{ transaction_date: "2026-06-03", vendor_raw: "Mismatch Vendor " + tag, amount: 50 }] }),
+  });
+  const batchId = (await importRes.json()).batch_id;
+  const res = await apiFetch(`/api/reconciliation/${batchId}`, { method: "PUT", body: JSON.stringify({ beginning_balance: 500, ending_balance: 500 }) });
+  const body = await res.json();
+  assert.equal(body.reconciliation_difference, 50, "500 + 50 charge should not equal an ending balance of 500");
+  assert.equal(body.reconciled, false);
+});
+
+// ---- Accountant exports (Priority 12) ----
+
+test("monthly register export is a CSV with the expected columns and a known row", async () => {
+  const tag = crypto.randomUUID();
+  await apiFetch("/api/transactions", {
+    method: "POST",
+    body: JSON.stringify({ transaction_date: "2026-09-24", vendor_raw: "Export Test Vendor " + tag, amount: 12.34, external_id: "test-export-" + tag }),
+  });
+  const res = await apiFetch("/api/export/register?month=2026-09");
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get("content-type"), /text\/csv/);
+  const text = await res.text();
+  assert.match(text, /^Transaction Date,Posted Date,Vendor,Amount,Category,Payment Method,Card\/Reference,Captain Reviewed,Receipt Attached,Owner Approval Status,Notes/);
+  assert.match(text, new RegExp(`Export Test Vendor ${tag}`));
+});
+
+test("exception report lists uncategorized and unreviewed transactions", async () => {
+  const tag = crypto.randomUUID();
+  await apiFetch("/api/transactions", {
+    method: "POST",
+    body: JSON.stringify({ transaction_date: "2026-09-25", vendor_raw: "Exception Test Vendor " + tag, amount: 8, external_id: "test-exception-" + tag }),
+  });
+  const res = await apiFetch("/api/export/exceptions?month=2026-09");
+  const body = await res.json();
+  assert.ok(body.uncategorized.some((r) => r.vendor_raw === "Exception Test Vendor " + tag));
+  assert.ok(body.unreviewed.some((r) => r.vendor_raw === "Exception Test Vendor " + tag));
+});
+
 // ---- Runner ----
 
 async function run() {

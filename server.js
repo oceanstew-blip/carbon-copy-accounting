@@ -349,6 +349,10 @@ async function init(){
       id BIGSERIAL PRIMARY KEY,card_id BIGINT REFERENCES cards(id) ON DELETE SET NULL,source_filename TEXT,
       file_hash TEXT UNIQUE,uploaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),statement_start DATE,statement_end DATE,
       row_count INT,imported_by TEXT NOT NULL DEFAULT 'captain');
+    ALTER TABLE import_batches ADD COLUMN IF NOT EXISTS beginning_balance NUMERIC(12,2);
+    ALTER TABLE import_batches ADD COLUMN IF NOT EXISTS ending_balance NUMERIC(12,2);
+    ALTER TABLE import_batches ADD COLUMN IF NOT EXISTS reconciled BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE import_batches ADD COLUMN IF NOT EXISTS reconciled_at TIMESTAMPTZ;
     ALTER TABLE transactions ADD COLUMN IF NOT EXISTS import_batch_id BIGINT REFERENCES import_batches(id) ON DELETE SET NULL;
     ALTER TABLE transactions ADD COLUMN IF NOT EXISTS source_row_number INT;
     ALTER TABLE transactions ADD COLUMN IF NOT EXISTS duplicate_status TEXT NOT NULL DEFAULT 'none' CHECK(duplicate_status IN('none','suspected'));
@@ -923,6 +927,120 @@ app.get("/api/audit-log",async(req,res,next)=>{try{
      WHERE ($1::text IS NULL OR entity_type=$1) AND ($2::text IS NULL OR entity_id=$2)
      ORDER BY id DESC LIMIT $3`,[entityType,entityId,limit]);
   res.json({rows:q.rows});
+}catch(e){next(e)}});
+
+function csvCell(v){
+  if(v===null||v===undefined)return "";
+  const s=String(v);
+  return /[",\n]/.test(s)?`"${s.replaceAll('"','""')}"`:s;
+}
+app.get("/api/import-batches",async(_req,res,next)=>{try{
+  const q=await pool.query(`SELECT id,source_filename,file_hash,uploaded_at,statement_start,statement_end,row_count,
+    beginning_balance,ending_balance,reconciled,reconciled_at FROM import_batches ORDER BY uploaded_at DESC LIMIT 50`);
+  res.json({rows:q.rows});
+}catch(e){next(e)}});
+
+app.get("/api/reconciliation/:batchId",async(req,res,next)=>{try{
+  const batchId=Number(req.params.batchId);
+  const batch=(await pool.query("SELECT * FROM import_batches WHERE id=$1",[batchId])).rows[0];
+  if(!batch)return res.status(404).json({error:"Import batch not found"});
+  const [totals,receiptGaps,suspected]=await Promise.all([
+    pool.query(`SELECT COUNT(*)::int imported_row_count,
+        COALESCE(SUM(amount) FILTER(WHERE amount>0),0)::numeric imported_charge_total,
+        COALESCE(SUM(amount) FILTER(WHERE amount<0),0)::numeric imported_credit_total
+      FROM transactions WHERE import_batch_id=$1`,[batchId]),
+    pool.query(`SELECT COUNT(*)::int missing_receipt_count FROM transactions t LEFT JOIN receipts r ON r.transaction_id=t.id
+      WHERE t.import_batch_id=$1 AND r.id IS NULL`,[batchId]),
+    pool.query(`SELECT COUNT(*)::int suspected_duplicate_count FROM transactions WHERE import_batch_id=$1 AND duplicate_status='suspected'`,[batchId])
+  ]);
+  const t=totals.rows[0],rg=receiptGaps.rows[0],sd=suspected.rows[0];
+  const unmatchedReceipts=(await pool.query(`SELECT COUNT(*)::int count FROM receipts WHERE transaction_id IS NULL AND payment_method='credit_card'
+    AND receipt_date BETWEEN $1::date AND $2::date`,[batch.statement_start,batch.statement_end])).rows[0].count;
+  let reconciliationDifference=null;
+  if(batch.beginning_balance!=null&&batch.ending_balance!=null){
+    const expectedEnding=Number(batch.beginning_balance)+Number(t.imported_charge_total)+Number(t.imported_credit_total);
+    reconciliationDifference=Math.round((expectedEnding-Number(batch.ending_balance))*100)/100;
+  }
+  const cleanExceptions=rg.missing_receipt_count===0&&sd.suspected_duplicate_count===0&&unmatchedReceipts===0;
+  res.json({
+    batch_id:batchId,source_filename:batch.source_filename,statement_start:batch.statement_start,statement_end:batch.statement_end,
+    beginning_balance:batch.beginning_balance,ending_balance:batch.ending_balance,
+    imported_row_count:t.imported_row_count,imported_charge_total:t.imported_charge_total,imported_credit_total:t.imported_credit_total,
+    unmatched_receipt_count:unmatchedReceipts,missing_receipt_count:rg.missing_receipt_count,suspected_duplicate_count:sd.suspected_duplicate_count,
+    reconciliation_difference:reconciliationDifference,
+    reconciliation_status:batch.reconciled?"reconciled":(reconciliationDifference===null?"needs_balances":(reconciliationDifference===0&&cleanExceptions?"ready":"discrepancy")),
+    reconciled:batch.reconciled,reconciled_at:batch.reconciled_at
+  });
+}catch(e){next(e)}});
+
+app.put("/api/reconciliation/:batchId",async(req,res,next)=>{try{
+  const batchId=Number(req.params.batchId);
+  const beginningBalance=moneyNum(req.body.beginning_balance),endingBalance=moneyNum(req.body.ending_balance);
+  if(beginningBalance===null||endingBalance===null)return res.status(400).json({error:"beginning_balance and ending_balance are required"});
+  const batch=(await pool.query("SELECT * FROM import_batches WHERE id=$1",[batchId])).rows[0];
+  if(!batch)return res.status(404).json({error:"Import batch not found"});
+  await pool.query("UPDATE import_batches SET beginning_balance=$1,ending_balance=$2 WHERE id=$3",[beginningBalance,endingBalance,batchId]);
+  // Recompute status the same way the GET does, and only mark reconciled when it's actually clean.
+  const totals=(await pool.query(`SELECT COALESCE(SUM(amount) FILTER(WHERE amount>0),0)::numeric charges,
+      COALESCE(SUM(amount) FILTER(WHERE amount<0),0)::numeric credits FROM transactions WHERE import_batch_id=$1`,[batchId])).rows[0];
+  const missing=(await pool.query(`SELECT COUNT(*)::int c FROM transactions t LEFT JOIN receipts r ON r.transaction_id=t.id WHERE t.import_batch_id=$1 AND r.id IS NULL`,[batchId])).rows[0].c;
+  const dup=(await pool.query("SELECT COUNT(*)::int c FROM transactions WHERE import_batch_id=$1 AND duplicate_status='suspected'",[batchId])).rows[0].c;
+  const unmatched=(await pool.query(`SELECT COUNT(*)::int c FROM receipts WHERE transaction_id IS NULL AND payment_method='credit_card' AND receipt_date BETWEEN $1::date AND $2::date`,[batch.statement_start,batch.statement_end])).rows[0].c;
+  const diff=Math.round((beginningBalance+Number(totals.charges)+Number(totals.credits)-endingBalance)*100)/100;
+  const clean=diff===0&&missing===0&&dup===0&&unmatched===0;
+  await pool.query(`UPDATE import_batches SET reconciled=$1,reconciled_at=CASE WHEN $1 THEN NOW() ELSE NULL END WHERE id=$2`,[clean,batchId]);
+  await audit("captain","reconcile","import_batch",batchId,{reconciled:batch.reconciled},{reconciled:clean,difference:diff},{source:"PUT /api/reconciliation/:batchId"});
+  res.json({batch_id:batchId,reconciliation_difference:diff,reconciled:clean});
+}catch(e){next(e)}});
+
+app.get("/api/export/register",async(req,res,next)=>{try{
+  const {month,start,next:n}=monthBounds(req.query.month);
+  const q=await pool.query(`SELECT t.transaction_date,t.posted_date,COALESCE(NULLIF(t.vendor_normalized,''),t.vendor_raw) vendor,t.amount,
+      c.name category_name,t.payment_method,COALESCE(cd.last4,t.payment_reference) card_or_reference,
+      t.captain_reviewed,r.id receipt_id,t.approval_status,t.notes
+    FROM transactions t LEFT JOIN categories c ON c.id=t.category_id LEFT JOIN cards cd ON cd.id=t.card_id LEFT JOIN receipts r ON r.transaction_id=t.id
+    WHERE t.status='posted' AND t.transaction_date >= $1::date AND t.transaction_date < $2::date
+    ORDER BY t.transaction_date,t.id`,[start,n]);
+  const headers=["Transaction Date","Posted Date","Vendor","Amount","Category","Payment Method","Card/Reference","Captain Reviewed","Receipt Attached","Owner Approval Status","Notes"];
+  const lines=[headers.join(",")];
+  for(const r of q.rows){
+    lines.push([
+      r.transaction_date instanceof Date?r.transaction_date.toISOString().slice(0,10):r.transaction_date,
+      r.posted_date instanceof Date?r.posted_date.toISOString().slice(0,10):r.posted_date,
+      r.vendor,Number(r.amount).toFixed(2),r.category_name||"Uncategorized",r.payment_method,r.card_or_reference,
+      r.captain_reviewed?"Yes":"No",r.receipt_id?"Yes":"No",r.approval_status,r.notes
+    ].map(csvCell).join(","));
+  }
+  res.set("Content-Type","text/csv");
+  res.set("Content-Disposition",`attachment; filename="carbon-copy-register-${month}.csv"`);
+  res.send(lines.join("\n"));
+}catch(e){next(e)}});
+
+app.get("/api/export/exceptions",async(req,res,next)=>{try{
+  const {month,start,next:n}=monthBounds(req.query.month);
+  const [missingReceipts,unmatchedCardReceipts,uncategorized,unreviewed,suspectedDuplicates,approvalNeeded]=await Promise.all([
+    pool.query(`SELECT t.id,t.transaction_date,t.vendor_raw,t.amount FROM transactions t LEFT JOIN receipts r ON r.transaction_id=t.id
+      WHERE r.id IS NULL AND t.status='posted' AND t.payment_method<>'cash' AND t.transaction_date>=$1::date AND t.transaction_date<$2::date ORDER BY t.transaction_date`,[start,n]),
+    pool.query(`SELECT id,receipt_date,vendor,amount FROM receipts WHERE transaction_id IS NULL AND payment_method='credit_card'
+      AND receipt_date>=$1::date AND receipt_date<$2::date ORDER BY receipt_date`,[start,n]),
+    pool.query(`SELECT id,transaction_date,vendor_raw,amount FROM transactions WHERE category_id IS NULL AND status='posted'
+      AND transaction_date>=$1::date AND transaction_date<$2::date ORDER BY transaction_date`,[start,n]),
+    pool.query(`SELECT id,transaction_date,vendor_raw,amount FROM transactions WHERE captain_reviewed=false AND status='posted'
+      AND transaction_date>=$1::date AND transaction_date<$2::date ORDER BY transaction_date`,[start,n]),
+    pool.query(`SELECT id,transaction_date,vendor_raw,amount FROM transactions WHERE duplicate_status='suspected' AND status='posted'
+      AND transaction_date>=$1::date AND transaction_date<$2::date ORDER BY transaction_date`,[start,n]),
+    pool.query(`SELECT id,transaction_date,vendor_raw,amount FROM transactions WHERE approval_status='needed' AND status='posted'
+      AND transaction_date>=$1::date AND transaction_date<$2::date ORDER BY transaction_date`,[start,n]),
+  ]);
+  res.json({
+    month,
+    missing_receipts:missingReceipts.rows,
+    unmatched_card_receipts:unmatchedCardReceipts.rows,
+    uncategorized:uncategorized.rows,
+    unreviewed:unreviewed.rows,
+    suspected_duplicates:suspectedDuplicates.rows,
+    owner_approval_needed:approvalNeeded.rows,
+  });
 }catch(e){next(e)}});
 
 app.get("/api/report",async(req,res,next)=>{try{
