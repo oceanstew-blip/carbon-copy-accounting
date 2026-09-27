@@ -3,7 +3,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "maintenance:legacy-cleanup": "node server.js --legacy-cleanup",
+    "maintenance:seed-once": "node server.js --seed-once",
+    "maintenance:purge-expired": "node server.js --purge-expired"
   },
   "engines": {
     "node": ">=20"

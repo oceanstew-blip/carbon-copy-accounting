@@ -329,8 +329,12 @@ async function init(){
   await pool.query("INSERT INTO cards(label,last4) VALUES($1,$2) ON CONFLICT(last4) DO NOTHING",["Capital One","0945"]);
   const cats=["Fuel & Lubricants","Dockage / Marina","Repairs & Maintenance","Provisions","Supplies","Insurance","Communications / Internet","Crew Travel","Crew Meals","Training / Certifications","Safety Equipment","Tender / Toys","Professional Services","Shipping / Freight","Customs / Port Fees","Guest Expenses","Transportation","Capital Improvements","Owner / Personal","Navigation / Weather","Miscellaneous"];
   for(let i=0;i<cats.length;i++)await pool.query("INSERT INTO categories(name,sort_order) VALUES($1,$2) ON CONFLICT(name) DO NOTHING",[cats[i],(i+1)*10]);
-  await seedInitialData();
-  await purgeExpiredReceipts();
+  // ponytail: seedInitialData() (imports seed.js's historical CSV/receipts, and
+  // reclassifies existing uncategorized transactions) and purgeExpiredReceipts()
+  // used to run here unconditionally on every startup/deploy, mutating live
+  // accounting data every time the server restarted. Both are one-time/explicit
+  // operations now — run `node server.js --seed-once` or
+  // `node server.js --purge-expired`, not automatically.
 }
 function parseCsvLine(line){
   const out=[];let cur="",q=false;
@@ -393,7 +397,9 @@ async function purgeExpiredReceipts(){
   await pool.query(`UPDATE receipts SET file_data=NULL,source_url=NULL,purged_at=NOW()
     WHERE purged_at IS NULL AND expires_at IS NOT NULL AND expires_at <= NOW()`);
 }
-setInterval(()=>purgeExpiredReceipts().catch(console.error),24*60*60*1000).unref();
+// ponytail: no more automatic 24h purge loop — financial support documents
+// should not disappear on their own. Run scripts/purge-expired-receipts.js
+// by hand if a document-retention policy is ever agreed with the accountant.
 
 async function matchAllReceipts(){
   const q=await pool.query("SELECT id FROM receipts WHERE transaction_id IS NULL AND amount IS NOT NULL AND receipt_date IS NOT NULL");
@@ -612,8 +618,9 @@ async function repairOrphanNonCardReceipts(){
   return repaired;
 }
 
-const ORPHAN_NONCARD_STARTUP_REPAIR=await repairOrphanNonCardReceipts();
-console.log("ORPHAN_NONCARD_STARTUP_REPAIR",ORPHAN_NONCARD_STARTUP_REPAIR);
+// ponytail: repair used to also run unconditionally here on every startup/deploy,
+// mutating live transactions on every restart. It already runs per-request below
+// (the only place it needs to), so the startup call was pure redundant risk.
 
 app.get("/api/receipt-inbox",async(_req,res,next)=>{try{
   await repairOrphanNonCardReceipts();
@@ -779,8 +786,10 @@ app.post("/api/close-month",async(req,res,next)=>{try{
 
 app.use((err,_req,res,_next)=>{console.error(err);if(err.code==="LIMIT_FILE_SIZE")return res.status(413).json({error:"Receipt must be under 20MB per image"});if(err.statusCode)return res.status(err.statusCode).json({error:err.message});res.status(500).json({error:"Server error"})});
 
-await init();
-try{
+// ponytail: legacy one-off receipt cleanup (vendor payment_method fix + filename
+// normalization) used to run unconditionally on every startup/deploy. It's now an
+// explicit maintenance command instead: `node server.js --legacy-cleanup`.
+async function legacyReceiptCleanup(){
   await pool.query(`UPDATE receipts
     SET payment_method='credit_card'
     WHERE transaction_id IS NULL
@@ -807,10 +816,20 @@ try{
     if(renamed!==r.file_name) await pool.query("UPDATE receipts SET file_name=$1 WHERE id=$2",[renamed,r.id]);
   }
   console.log("LEGACY_FILENAME_REFRESH complete");
-}catch(e){console.error("LEGACY_RECEIPT_NORMALIZE failed",e)}
+}
 
-
-
-
+// Maintenance commands: run schema/reference-data init (always needed), then exit
+// without starting the server if a one-time data operation was explicitly requested.
+// Normal boot (`npm start` / `node server.js`) never touches transaction/receipt data.
+await init();
+const maintenanceFlag=process.argv.find(a=>["--legacy-cleanup","--seed-once","--purge-expired"].includes(a));
+if(maintenanceFlag){
+  if(maintenanceFlag==="--legacy-cleanup")await legacyReceiptCleanup();
+  if(maintenanceFlag==="--seed-once")await seedInitialData();
+  if(maintenanceFlag==="--purge-expired")await purgeExpiredReceipts();
+  console.log(`${maintenanceFlag} complete`);
+  await pool.end();
+  process.exit(0);
+}
 
 app.listen(port,"0.0.0.0",()=>console.log(`Carbon Copy Accounting listening on ${port}`));
