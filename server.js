@@ -487,10 +487,10 @@ app.get("/api/ocr/status",(_req,res)=>res.json({enabled:true,mode:"server-side",
 app.get("/api/ocr/self-test",async(_req,res,next)=>{try{
   const svg=Buffer.from(`<svg width="1200" height="700" xmlns="http://www.w3.org/2000/svg">
     <rect width="100%" height="100%" fill="white"/>
-    <text x="80" y="130" font-family="Arial" font-size="58" fill="black">HARBOR MARINE SUPPLY</text>
-    <text x="80" y="240" font-family="Arial" font-size="48" fill="black">09/26/2026</text>
-    <text x="80" y="350" font-family="Arial" font-size="42" fill="black">Bilge pump hose and stainless clamps</text>
-    <text x="80" y="470" font-family="Arial" font-size="54" fill="black">TOTAL $87.46</text>
+    <text x="80" y="130" font-family="DejaVu Sans, Liberation Sans, sans-serif" font-size="58" fill="black">HARBOR MARINE SUPPLY</text>
+    <text x="80" y="240" font-family="DejaVu Sans, Liberation Sans, sans-serif" font-size="48" fill="black">09/26/2026</text>
+    <text x="80" y="350" font-family="DejaVu Sans, Liberation Sans, sans-serif" font-size="42" fill="black">Bilge pump hose and stainless clamps</text>
+    <text x="80" y="470" font-family="DejaVu Sans, Liberation Sans, sans-serif" font-size="54" fill="black">TOTAL $87.46</text>
   </svg>`);
   const png=await sharp(svg).png().toBuffer();
   const data=await ocrImage(png);
@@ -499,7 +499,7 @@ app.get("/api/ocr/self-test",async(_req,res,next)=>{try{
   const dateOk=data.receipt_date==="2026-09-26";
   const categoryOk=data.suggested_category==="Repairs & Maintenance";
   const ok=vendorOk&&amountOk&&dateOk&&categoryOk;
-  res.status(ok?200:503).json({ok,vendor_ok:vendorOk,amount_ok:amountOk,date_ok:dateOk,category_ok:categoryOk,confidence:data.confidence,parsed:{vendor:data.vendor,receipt_date:data.receipt_date,amount:data.amount,suggested_category:data.suggested_category}});
+  res.status(ok?200:503).json({ok,vendor_ok:vendorOk,amount_ok:amountOk,date_ok:dateOk,category_ok:categoryOk,confidence:data.confidence,parsed:{vendor:data.vendor,receipt_date:data.receipt_date,amount:data.amount,suggested_category:data.suggested_category},raw_ocr_text:data.receipt_text});
 }catch(e){next(e)}});
 
 
