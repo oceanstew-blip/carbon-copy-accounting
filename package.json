@@ -9,7 +9,8 @@
     "maintenance:seed-once": "node server.js --seed-once",
     "maintenance:purge-expired": "node server.js --purge-expired",
     "maintenance:backup": "node server.js --backup",
-    "maintenance:monitor": "node server.js --monitor"
+    "maintenance:monitor": "node server.js --monitor",
+    "maintenance:pull-receipts": "node server.js --pull-receipts"
   },
   "engines": {
     "node": ">=20"
@@ -17,6 +18,8 @@
   "dependencies": {
     "aws4fetch": "^1.0.20",
     "express": "^5.1.0",
+    "imapflow": "^2.0.8",
+    "mailparser": "^3.9.28",
     "multer": "^2.0.2",
     "nodemailer": "^10.0.11",
     "pg": "^8.16.3",

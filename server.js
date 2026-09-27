@@ -1284,6 +1284,68 @@ async function backupDatabase(){
   return{uploaded:true,key,bytes:gz.length,tables:tables.length};
 }
 
+// Emailed receipts never auto-create a transaction — only the captain confirming
+// cash/check/wire fields in Review/Fix does that. An emailed receipt always lands
+// as payment_method='credit_card' (unless the text clearly says otherwise) with
+// review_required=true, same as a manually-uploaded credit-card receipt: it just
+// waits to match a statement charge, or sits in Needs Review if OCR came up short.
+async function ingestReceiptFromEmail(buffer,mimetype,filename){
+  const allowed=["image/jpeg","image/png","image/webp","image/heic","image/heif","application/pdf"];
+  if(!allowed.includes(mimetype))return{skipped:true,reason:`unsupported type ${mimetype}`};
+  const sha=crypto.createHash("sha256").update(buffer).digest("hex");
+  const existing=(await pool.query("SELECT id FROM receipts WHERE file_sha256=$1",[sha])).rows[0];
+  if(existing)return{skipped:true,reason:"duplicate",id:existing.id};
+  let parsed={vendor:null,receipt_date:null,amount:null,suggested_category:null,detected_payment_method:null,receipt_text:null};
+  if(mimetype!=="application/pdf"){
+    try{
+      const data=await ocrImage(buffer);
+      parsed={vendor:data.vendor,receipt_date:data.receipt_date,amount:data.amount,suggested_category:data.suggested_category,detected_payment_method:data.detected_payment_method,receipt_text:data.receipt_text};
+    }catch(e){console.error("EMAIL_RECEIPT_OCR_FAILED",e.message)}
+  }
+  const paymentMethod=(parsed.detected_payment_method&&parsed.detected_payment_method!=="credit_card")?parsed.detected_payment_method:"credit_card";
+  const finalName=receiptFileName(parsed.vendor,parsed.receipt_date,parsed.amount,mimetype,filename||"receipt");
+  const q=await pool.query(`INSERT INTO receipts(transaction_id,file_name,content_type,file_size,file_data,receipt_date,vendor,amount,category_id,file_sha256,receipt_text,expires_at,payment_method,review_required)
+    VALUES(NULL,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW()+INTERVAL '60 days',$11,true) RETURNING id`,
+    [finalName,mimetype,buffer.length,buffer,parsed.receipt_date,parsed.vendor,parsed.amount,null,sha,parsed.receipt_text,paymentMethod]);
+  const matched=paymentMethod==="credit_card"?await autoMatchReceipt(q.rows[0].id):null;
+  return{skipped:false,id:q.rows[0].id,matched_transaction_id:matched,payment_method:paymentMethod};
+}
+
+async function pullReceiptEmails(){
+  const user=process.env.GMAIL_USER,pass=process.env.GMAIL_APP_PASSWORD;
+  if(!user||!pass){console.log("PULL_RECEIPTS_SKIPPED: Gmail not configured");return{pulled:0,skipped:0,errors:0}}
+  const {ImapFlow}=await import("imapflow");
+  const {simpleParser}=await import("mailparser");
+  const client=new ImapFlow({host:"imap.gmail.com",port:993,secure:true,auth:{user,pass},logger:false});
+  let pulled=0,skipped=0,errors=0;
+  await client.connect();
+  try{
+    await client.mailboxOpen("INBOX");
+    const uids=await client.search({seen:false},{uid:true});
+    for(const uid of uids||[]){
+      try{
+        const msg=await client.download(uid,undefined,{uid:true});
+        const parsedMail=await simpleParser(msg.content);
+        const attachments=(parsedMail.attachments||[]).filter((a)=>a.size>0);
+        if(!attachments.length){
+          await client.messageFlagsAdd(uid,["\\Seen"],{uid:true});
+          continue;
+        }
+        for(const att of attachments){
+          const result=await ingestReceiptFromEmail(att.content,att.contentType,att.filename);
+          if(result.skipped)skipped++;else pulled++;
+          console.log(`PULL_RECEIPT uid=${uid} file=${att.filename} -> ${result.skipped?"skipped ("+result.reason+")":"receipt #"+result.id}`);
+        }
+        await client.messageFlagsAdd(uid,["\\Seen"],{uid:true});
+      }catch(e){errors++;console.error(`PULL_RECEIPT_ERROR uid=${uid}`,e.message)}
+    }
+  }finally{
+    await client.logout().catch(()=>{});
+  }
+  console.log(`PULL_RECEIPTS_COMPLETE pulled=${pulled} skipped=${skipped} errors=${errors}`);
+  return{pulled,skipped,errors};
+}
+
 async function runMonitorCheck(){
   const results=[];
   const check=async(name,fn)=>{try{const detail=await fn();results.push({name,ok:true,detail})}catch(e){results.push({name,ok:false,detail:e.message})}};
@@ -1323,13 +1385,14 @@ async function runMonitorCheck(){
 // without starting the server if a one-time data operation was explicitly requested.
 // Normal boot (`npm start` / `node server.js`) never touches transaction/receipt data.
 await init();
-const maintenanceFlag=process.argv.find(a=>["--legacy-cleanup","--seed-once","--purge-expired","--backup","--monitor"].includes(a));
+const maintenanceFlag=process.argv.find(a=>["--legacy-cleanup","--seed-once","--purge-expired","--backup","--monitor","--pull-receipts"].includes(a));
 if(maintenanceFlag){
   if(maintenanceFlag==="--legacy-cleanup")await legacyReceiptCleanup();
   if(maintenanceFlag==="--seed-once")await seedInitialData();
   if(maintenanceFlag==="--purge-expired")await purgeExpiredReceipts();
   if(maintenanceFlag==="--backup")await backupDatabase();
   if(maintenanceFlag==="--monitor")await runMonitorCheck();
+  if(maintenanceFlag==="--pull-receipts")await pullReceiptEmails();
   console.log(`${maintenanceFlag} complete`);
   await pool.end();
   process.exit(0);
