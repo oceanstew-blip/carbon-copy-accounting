@@ -290,6 +290,11 @@ async function assertMonthOpen(dateVal){
   const closed=(await pool.query("SELECT closed FROM month_closes WHERE month_start=$1",[monthStart])).rows[0]?.closed;
   if(closed){const e=new Error(`${iso.slice(0,7)} is closed. Reopen the month before making this change.`);e.statusCode=409;throw e}
 }
+async function approvalStatusFor(amount){
+  const row=(await pool.query("SELECT value FROM settings WHERE key='owner_approval_threshold'")).rows[0];
+  const threshold=row?Number(row.value):null;
+  return Number.isFinite(threshold)&&Math.abs(Number(amount))>=threshold?"needed":"not_required";
+}
 function fingerprint(r){
   return crypto.createHash("sha256").update([
     r.transaction_date||"",r.posted_date||"",String(r.card_last4||"0945").padStart(4,"0"),
@@ -352,6 +357,12 @@ async function init(){
       actor TEXT NOT NULL CHECK(actor IN('captain','system')),action TEXT NOT NULL,
       entity_type TEXT NOT NULL,entity_id TEXT,old_data JSONB,new_data JSONB,reason TEXT,source TEXT);
     CREATE INDEX IF NOT EXISTS audit_log_entity_idx ON audit_log(entity_type,entity_id);
+    CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value JSONB);
+    ALTER TABLE transactions ADD COLUMN IF NOT EXISTS approval_status TEXT NOT NULL DEFAULT 'not_required'
+      CHECK(approval_status IN('not_required','needed','approved','declined','emergency_approved'));
+    ALTER TABLE transactions ADD COLUMN IF NOT EXISTS approval_date TIMESTAMPTZ;
+    ALTER TABLE transactions ADD COLUMN IF NOT EXISTS approval_note TEXT;
+    ALTER TABLE transactions ADD COLUMN IF NOT EXISTS approved_by TEXT;
   `);
   await pool.query("INSERT INTO cards(label,last4) VALUES($1,$2) ON CONFLICT(last4) DO NOTHING",["Capital One","0945"]);
   const cats=["Fuel & Lubricants","Dockage / Marina","Repairs & Maintenance","Provisions","Supplies","Insurance","Communications / Internet","Crew Travel","Crew Meals","Training / Certifications","Safety Equipment","Tender / Toys","Professional Services","Shipping / Freight","Customs / Port Fees","Guest Expenses","Transportation","Capital Improvements","Owner / Personal","Navigation / Weather","Miscellaneous"];
@@ -388,6 +399,10 @@ async function seedInitialData(){
     const row={transaction_date:csvDate(c[ix("transaction date")]),posted_date:csvDate(c[ix("posted date")]),vendor_raw:c[ix("description")]||"",amount,card_last4:String(c[ix("card no")]||"945").padStart(4,"0")};
     if(!row.transaction_date||!row.vendor_raw||row.amount===null)continue;
     const ext=fingerprint(row),rule=(await pool.query("SELECT category_id FROM vendor_rules WHERE $1 ILIKE '%'||vendor_pattern||'%' ORDER BY length(vendor_pattern) DESC LIMIT 1",[row.vendor_raw])).rows[0];
+    // ponytail: deliberately not setting approval_status here — this seeds old
+    // historical statement data (--seed-once only), and retroactively flagging
+    // months-old already-processed charges as "needs owner approval" would just
+    // be noise, not a real pending decision.
     await pool.query(`INSERT INTO transactions(transaction_date,posted_date,vendor_raw,vendor_normalized,amount,category_id,card_id,source,external_id,status)
       VALUES($1,$2,$3,$3,$4,$5,$6,'capital-one-csv',$7,'posted') ON CONFLICT DO NOTHING`,
       [row.transaction_date,row.posted_date,row.vendor_raw,row.amount,rule?.category_id||null,card?.id||null,ext]);
@@ -496,11 +511,22 @@ app.post("/api/ocr",upload.any(),async(req,res,next)=>{try{
 
 
 app.get("/api/bootstrap",async(_req,res,next)=>{try{
-  const [c,cd,r]=await Promise.all([
+  const [c,cd,r,threshold]=await Promise.all([
     pool.query("SELECT id,name,sort_order FROM categories WHERE active=true ORDER BY sort_order,name"),
     pool.query("SELECT id,label,last4 FROM cards WHERE active=true ORDER BY id"),
-    pool.query("SELECT vr.id,vr.vendor_pattern,vr.category_id,c.name category_name FROM vendor_rules vr JOIN categories c ON c.id=vr.category_id ORDER BY vr.vendor_pattern")
-  ]);res.json({categories:c.rows,cards:cd.rows,rules:r.rows,payment_methods:["credit_card","wire","check","cash"]})
+    pool.query("SELECT vr.id,vr.vendor_pattern,vr.category_id,c.name category_name FROM vendor_rules vr JOIN categories c ON c.id=vr.category_id ORDER BY vr.vendor_pattern"),
+    pool.query("SELECT value FROM settings WHERE key='owner_approval_threshold'")
+  ]);res.json({categories:c.rows,cards:cd.rows,rules:r.rows,payment_methods:["credit_card","wire","check","cash"],owner_approval_threshold:threshold.rows[0]?Number(threshold.rows[0].value):null})
+}catch(e){next(e)}});
+
+app.put("/api/settings/owner-approval-threshold",async(req,res,next)=>{try{
+  const value=req.body.value===null?null:Number(req.body.value);
+  if(value!==null&&!(Number.isFinite(value)&&value>=0))return res.status(400).json({error:"Threshold must be a non-negative number or null to disable"});
+  const before=(await pool.query("SELECT value FROM settings WHERE key='owner_approval_threshold'")).rows[0]?.value??null;
+  await pool.query(`INSERT INTO settings(key,value) VALUES('owner_approval_threshold',$1::jsonb)
+    ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value`,[JSON.stringify(value)]);
+  await audit("captain","update","setting","owner_approval_threshold",{value:before},{value},{source:"PUT /api/settings/owner-approval-threshold"});
+  res.json({owner_approval_threshold:value});
 }catch(e){next(e)}});
 
 app.get("/api/dashboard",async(req,res,next)=>{try{
@@ -510,7 +536,8 @@ app.get("/api/dashboard",async(req,res,next)=>{try{
       COUNT(*) FILTER(WHERE t.category_id IS NULL)::int needs_category,
       COUNT(*) FILTER(WHERE r.id IS NULL)::int missing_receipts,
       COUNT(*) FILTER(WHERE t.captain_reviewed=false)::int needs_review,
-      COUNT(*) FILTER(WHERE t.duplicate_status='suspected')::int suspected_duplicates
+      COUNT(*) FILTER(WHERE t.duplicate_status='suspected')::int suspected_duplicates,
+      COUNT(*) FILTER(WHERE t.approval_status='needed')::int owner_approval_needed
       FROM transactions t LEFT JOIN receipts r ON r.transaction_id=t.id
       WHERE t.status='posted' AND t.transaction_date >= $1::date AND t.transaction_date < $2::date`,[start,n]),
     pool.query(`SELECT COALESCE(c.name,'Uncategorized') name,COALESCE(SUM(t.amount),0)::numeric total
@@ -526,7 +553,8 @@ app.get("/api/dashboard",async(req,res,next)=>{try{
 app.get("/api/transactions",async(req,res,next)=>{try{
   const {start,next:n}=monthBounds(req.query.month);
   const q=await pool.query(`SELECT t.id,t.transaction_date,t.posted_date,t.vendor_raw,t.vendor_normalized,t.amount,t.notes,t.status,t.captain_reviewed,
-    c.id category_id,c.name category_name,cd.last4,r.id receipt_id,r.file_name,r.expires_at,r.purged_at,t.payment_method,t.payment_reference,t.duplicate_status
+    c.id category_id,c.name category_name,cd.last4,r.id receipt_id,r.file_name,r.expires_at,r.purged_at,t.payment_method,t.payment_reference,t.duplicate_status,
+    t.approval_status,t.approval_date,t.approval_note,t.approved_by
     FROM transactions t LEFT JOIN categories c ON c.id=t.category_id LEFT JOIN cards cd ON cd.id=t.card_id LEFT JOIN receipts r ON r.transaction_id=t.id
     WHERE t.transaction_date >= $1::date AND t.transaction_date < $2::date ORDER BY t.transaction_date DESC,t.id DESC`,[start,n]);
   res.json({rows:q.rows})
@@ -568,9 +596,10 @@ app.post("/api/transactions",async(req,res,next)=>{try{
     const fp=fingerprint(r);
     const rule=(await pool.query("SELECT category_id FROM vendor_rules WHERE $1 ILIKE '%'||vendor_pattern||'%' ORDER BY length(vendor_pattern) DESC LIMIT 1",[r.vendor_raw])).rows[0];
     const cardRow=(await pool.query("SELECT id FROM cards WHERE last4=$1 LIMIT 1",[r.card_last4])).rows[0]||card;
-    const insertArgs=(extId,dupStatus)=>[r.transaction_date,r.posted_date,r.vendor_raw,r.amount,rule?.category_id||null,r.payment_method==="credit_card"?(cardRow?.id||null):null,r.source||"import",extId,r.status==="pending"?"pending":"posted",r.payment_method,r.payment_reference||null,batchId,i,dupStatus];
-    const insertSql=`INSERT INTO transactions(transaction_date,posted_date,vendor_raw,vendor_normalized,amount,category_id,card_id,source,external_id,status,payment_method,payment_reference,import_batch_id,source_row_number,duplicate_status)
-        VALUES($1,$2,$3,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`;
+    const approvalStatus=await approvalStatusFor(r.amount);
+    const insertArgs=(extId,dupStatus)=>[r.transaction_date,r.posted_date,r.vendor_raw,r.amount,rule?.category_id||null,r.payment_method==="credit_card"?(cardRow?.id||null):null,r.source||"import",extId,r.status==="pending"?"pending":"posted",r.payment_method,r.payment_reference||null,batchId,i,dupStatus,approvalStatus];
+    const insertSql=`INSERT INTO transactions(transaction_date,posted_date,vendor_raw,vendor_normalized,amount,category_id,card_id,source,external_id,status,payment_method,payment_reference,import_batch_id,source_row_number,duplicate_status,approval_status)
+        VALUES($1,$2,$3,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`;
     if(clientSuppliedId){
       // A stable id from the client (e.g. a bank transaction id) means we can tell
       // for certain this is the same source row, not just a similar-looking one.
@@ -604,15 +633,21 @@ app.patch("/api/transactions/:id",async(req,res,next)=>{try{
   const paymentMethod=b.payment_method===undefined?c.payment_method:b.payment_method;
   const paymentReference=b.payment_reference===undefined?c.payment_reference:b.payment_reference;
   const duplicateStatus=b.duplicate_status==="none"?"none":c.duplicate_status;
-  await pool.query("UPDATE transactions SET category_id=$1,notes=$2,captain_reviewed=$3,vendor_normalized=$4,payment_method=$5,payment_reference=$6,duplicate_status=$7,updated_at=NOW() WHERE id=$8",[
-    newCategory,b.notes===undefined?c.notes:b.notes,reviewed,vendorName,paymentMethod,paymentReference,duplicateStatus,id]);
+  const validApprovalStatuses=["not_required","needed","approved","declined","emergency_approved"];
+  const approvalStatus=validApprovalStatuses.includes(b.approval_status)?b.approval_status:c.approval_status;
+  const approvalChanged=approvalStatus!==c.approval_status;
+  const approvalDate=approvalChanged&&["approved","declined","emergency_approved"].includes(approvalStatus)?new Date():c.approval_date;
+  const approvalNote=b.approval_note===undefined?c.approval_note:b.approval_note;
+  const approvedBy=approvalChanged&&["approved","declined","emergency_approved"].includes(approvalStatus)?"captain":c.approved_by;
+  await pool.query("UPDATE transactions SET category_id=$1,notes=$2,captain_reviewed=$3,vendor_normalized=$4,payment_method=$5,payment_reference=$6,duplicate_status=$7,approval_status=$8,approval_date=$9,approval_note=$10,approved_by=$11,updated_at=NOW() WHERE id=$12",[
+    newCategory,b.notes===undefined?c.notes:b.notes,reviewed,vendorName,paymentMethod,paymentReference,duplicateStatus,approvalStatus,approvalDate,approvalNote,approvedBy,id]);
   if(b.category_id!==undefined&&b.category_id!==null){
     await pool.query(`INSERT INTO vendor_rules(vendor_pattern,category_id) VALUES($1,$2)
       ON CONFLICT(vendor_pattern) DO UPDATE SET category_id=EXCLUDED.category_id,approved=true`,[vendorName,Number(b.category_id)]);
   }
   await audit("captain","update","transaction",id,
-    {category_id:c.category_id,notes:c.notes,captain_reviewed:c.captain_reviewed,vendor_normalized:c.vendor_normalized,payment_method:c.payment_method,payment_reference:c.payment_reference,duplicate_status:c.duplicate_status},
-    {category_id:newCategory,notes:b.notes===undefined?c.notes:b.notes,captain_reviewed:reviewed,vendor_normalized:vendorName,payment_method:paymentMethod,payment_reference:paymentReference,duplicate_status:duplicateStatus},
+    {category_id:c.category_id,notes:c.notes,captain_reviewed:c.captain_reviewed,vendor_normalized:c.vendor_normalized,payment_method:c.payment_method,payment_reference:c.payment_reference,duplicate_status:c.duplicate_status,approval_status:c.approval_status},
+    {category_id:newCategory,notes:b.notes===undefined?c.notes:b.notes,captain_reviewed:reviewed,vendor_normalized:vendorName,payment_method:paymentMethod,payment_reference:paymentReference,duplicate_status:duplicateStatus,approval_status:approvalStatus,approval_note:approvalNote},
     {source:"PATCH /api/transactions/:id"});
   res.json({ok:true,learned_vendor_rule:b.category_id!==undefined&&b.category_id!==null})
 }catch(e){next(e)}});
@@ -703,10 +738,10 @@ async function repairOrphanNonCardReceipts(){
   let repaired=0;
   for(const r of rows){
     const ext=crypto.createHash("sha256").update(["receipt-auto-repair",r.id,String(r.receipt_date).slice(0,10),r.payment_method,String(r.vendor).toUpperCase(),Number(r.amount).toFixed(2)].join("|")).digest("hex");
-    const tr=await pool.query(`INSERT INTO transactions(transaction_date,posted_date,vendor_raw,vendor_normalized,amount,category_id,card_id,source,external_id,status,payment_method,payment_reference,captain_reviewed)
-      VALUES($1,$1,$2,$2,$3,$4,NULL,'receipt-auto-repair',$5,'posted',$6,$7,$8)
+    const tr=await pool.query(`INSERT INTO transactions(transaction_date,posted_date,vendor_raw,vendor_normalized,amount,category_id,card_id,source,external_id,status,payment_method,payment_reference,captain_reviewed,approval_status)
+      VALUES($1,$1,$2,$2,$3,$4,NULL,'receipt-auto-repair',$5,'posted',$6,$7,$8,$9)
       ON CONFLICT(external_id) WHERE external_id IS NOT NULL DO NOTHING RETURNING id`,[
-        r.receipt_date,r.vendor,Number(r.amount),r.category_id||null,ext,r.payment_method,r.payment_reference||null,false
+        r.receipt_date,r.vendor,Number(r.amount),r.category_id||null,ext,r.payment_method,r.payment_reference||null,false,await approvalStatusFor(r.amount)
       ]);
     const tid=tr.rows[0]?.id||((await pool.query("SELECT id FROM transactions WHERE external_id=$1 LIMIT 1",[ext])).rows[0]?.id||null);
     if(tid){
@@ -752,8 +787,8 @@ app.post("/api/receipts",upload.any(),async(req,res,next)=>{try{
       if(useDate&&useVendor&&useAmount!==null){
         const chosenCategory=Number.isFinite(cat)?cat:(existing.category_id||null);
         const ext=crypto.createHash("sha256").update([useDate,paymentMethod,paymentReference||"",String(useVendor).toUpperCase(),Number(useAmount).toFixed(2)].join("|")).digest("hex");
-        const tr=await pool.query(`INSERT INTO transactions(transaction_date,posted_date,vendor_raw,vendor_normalized,amount,category_id,card_id,source,external_id,status,payment_method,payment_reference,captain_reviewed)
-          VALUES($1,$1,$2,$2,$3,$4,NULL,'manual',$5,'posted',$6,$7,$8) ON CONFLICT DO NOTHING RETURNING id`,[useDate,useVendor,useAmount,chosenCategory,ext,paymentMethod,paymentReference,Number.isFinite(cat)]);
+        const tr=await pool.query(`INSERT INTO transactions(transaction_date,posted_date,vendor_raw,vendor_normalized,amount,category_id,card_id,source,external_id,status,payment_method,payment_reference,captain_reviewed,approval_status)
+          VALUES($1,$1,$2,$2,$3,$4,NULL,'manual',$5,'posted',$6,$7,$8,$9) ON CONFLICT DO NOTHING RETURNING id`,[useDate,useVendor,useAmount,chosenCategory,ext,paymentMethod,paymentReference,Number.isFinite(cat),await approvalStatusFor(useAmount)]);
         const newTid=tr.rows[0]?.id||((await pool.query("SELECT id FROM transactions WHERE external_id=$1 LIMIT 1",[ext])).rows[0]?.id||null);
         if(newTid){
           await pool.query("UPDATE receipts SET transaction_id=$1,receipt_date=COALESCE(receipt_date,$2),vendor=COALESCE(vendor,$3),amount=COALESCE(amount,$4),category_id=COALESCE(category_id,$5),receipt_text=COALESCE(receipt_text,$6),review_required=false WHERE id=$7",[newTid,useDate,useVendor,useAmount,chosenCategory,receiptText,existing.id]);
@@ -782,9 +817,9 @@ app.post("/api/receipts",upload.any(),async(req,res,next)=>{try{
     const rule=(await pool.query("SELECT category_id FROM vendor_rules WHERE $1 ILIKE '%'||vendor_pattern||'%' ORDER BY length(vendor_pattern) DESC LIMIT 1",[vendor])).rows[0];
     const chosenCategory=inferredCat||rule?.category_id||null;
     const ext=crypto.createHash("sha256").update([date,paymentMethod,paymentReference||"",vendor.toUpperCase(),amount.toFixed(2)].join("|")).digest("hex");
-    const tr=await pool.query(`INSERT INTO transactions(transaction_date,posted_date,vendor_raw,vendor_normalized,amount,category_id,card_id,notes,source,external_id,status,payment_method,payment_reference,captain_reviewed)
-      VALUES($1,$1,$2,$2,$3,$4,NULL,NULL,'manual',$5,'posted',$6,$7,$8)
-      ON CONFLICT DO NOTHING RETURNING id`,[date,vendor,amount,chosenCategory,ext,paymentMethod,paymentReference,Number.isFinite(cat)]);
+    const tr=await pool.query(`INSERT INTO transactions(transaction_date,posted_date,vendor_raw,vendor_normalized,amount,category_id,card_id,notes,source,external_id,status,payment_method,payment_reference,captain_reviewed,approval_status)
+      VALUES($1,$1,$2,$2,$3,$4,NULL,NULL,'manual',$5,'posted',$6,$7,$8,$9)
+      ON CONFLICT DO NOTHING RETURNING id`,[date,vendor,amount,chosenCategory,ext,paymentMethod,paymentReference,Number.isFinite(cat),await approvalStatusFor(amount)]);
     tid=tr.rows[0]?.id||((await pool.query("SELECT id FROM transactions WHERE external_id=$1 LIMIT 1",[ext])).rows[0]?.id||null);
   }
   const q=await pool.query(`INSERT INTO receipts(transaction_id,file_name,content_type,file_size,file_data,receipt_date,vendor,amount,category_id,file_sha256,receipt_text,expires_at,payment_method,payment_reference,review_required)
@@ -831,10 +866,10 @@ app.patch("/api/receipts/:id",async(req,res,next)=>{try{
     const rule=(await pool.query("SELECT category_id FROM vendor_rules WHERE $1 ILIKE '%'||vendor_pattern||'%' ORDER BY length(vendor_pattern) DESC LIMIT 1",[vendor])).rows[0];
     const chosenCategory=categoryId||rule?.category_id||null;
     const ext=crypto.createHash("sha256").update(["receipt-correction",id,String(date).slice(0,10),paymentMethod,paymentReference||"",vendor.toUpperCase(),Number(amount).toFixed(2)].join("|")).digest("hex");
-    const tr=await pool.query(`INSERT INTO transactions(transaction_date,posted_date,vendor_raw,vendor_normalized,amount,category_id,card_id,source,external_id,status,payment_method,payment_reference,captain_reviewed)
-      VALUES($1,$1,$2,$2,$3,$4,NULL,'receipt-correction',$5,'posted',$6,$7,$8)
+    const tr=await pool.query(`INSERT INTO transactions(transaction_date,posted_date,vendor_raw,vendor_normalized,amount,category_id,card_id,source,external_id,status,payment_method,payment_reference,captain_reviewed,approval_status)
+      VALUES($1,$1,$2,$2,$3,$4,NULL,'receipt-correction',$5,'posted',$6,$7,$8,$9)
       ON CONFLICT(external_id) WHERE external_id IS NOT NULL DO NOTHING RETURNING id`,
-      [date,vendor,amount,chosenCategory,ext,paymentMethod,paymentReference,b.category_id!==undefined&&b.category_id!==null]);
+      [date,vendor,amount,chosenCategory,ext,paymentMethod,paymentReference,b.category_id!==undefined&&b.category_id!==null,await approvalStatusFor(amount)]);
     createdTransactionId=tr.rows[0]?.id||((await pool.query("SELECT id FROM transactions WHERE external_id=$1 LIMIT 1",[ext])).rows[0]?.id||null);
     if(createdTransactionId)await pool.query("UPDATE receipts SET transaction_id=$1,category_id=COALESCE(category_id,$2) WHERE id=$3",[createdTransactionId,chosenCategory,id]);
   }else if(!current.transaction_id && paymentMethod==="credit_card"){
@@ -911,10 +946,11 @@ app.post("/api/close-month",async(req,res,next)=>{try{
   const q=await pool.query(`SELECT COUNT(*) FILTER(WHERE t.category_id IS NULL)::int uncategorized,
     COUNT(*) FILTER(WHERE r.id IS NULL)::int missing_receipts,COUNT(*) FILTER(WHERE t.captain_reviewed=false)::int unreviewed,
     COUNT(*) FILTER(WHERE t.duplicate_status='suspected')::int suspected_duplicates,
+    COUNT(*) FILTER(WHERE t.approval_status='needed')::int owner_approval_needed,
     COALESCE(SUM(t.amount),0)::numeric total FROM transactions t LEFT JOIN receipts r ON r.transaction_id=t.id
     WHERE t.status='posted' AND t.transaction_date >= $1::date AND t.transaction_date < $2::date`,[start,n]);
   const c=q.rows[0],u=(await pool.query("SELECT COUNT(*)::int count FROM receipts WHERE transaction_id IS NULL AND receipt_date >= $1::date AND receipt_date < $2::date",[start,n])).rows[0].count;
-  if(c.uncategorized||c.missing_receipts||c.unreviewed||c.suspected_duplicates||u)return res.status(409).json({closed:false,blockers:{...c,unmatched_receipts:u}});
+  if(c.uncategorized||c.missing_receipts||c.unreviewed||c.suspected_duplicates||c.owner_approval_needed||u)return res.status(409).json({closed:false,blockers:{...c,unmatched_receipts:u}});
   await pool.query(`INSERT INTO month_closes(month_start,calculated_total,closed,closed_at) VALUES($1,$2,true,NOW())
     ON CONFLICT(month_start) DO UPDATE SET calculated_total=EXCLUDED.calculated_total,closed=true,closed_at=NOW()`,[start,Number(c.total)]);
   await audit("captain","month_close","month",month,null,{calculated_total:Number(c.total)},{source:"POST /api/close-month"});

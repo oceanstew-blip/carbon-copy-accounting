@@ -407,6 +407,54 @@ test("closed month blocks editing an existing transaction, and reopening require
   assert.deepEqual(log.rows.map((r) => r.action).sort(), ["month_close", "month_reopen"]);
 });
 
+// ---- Owner approval thresholds (Priority 11) ----
+
+test("transactions above the configured threshold need approval; below it, they don't", async () => {
+  const setRes = await apiFetch("/api/settings/owner-approval-threshold", { method: "PUT", body: JSON.stringify({ value: 1000 }) });
+  assert.equal(setRes.status, 200);
+  const tag = crypto.randomUUID();
+  await apiFetch("/api/transactions", {
+    method: "POST",
+    body: JSON.stringify({ rows: [
+      { transaction_date: "2026-09-19", vendor_raw: "Big Spend " + tag, amount: 5000, external_id: "big-" + tag },
+      { transaction_date: "2026-09-19", vendor_raw: "Small Spend " + tag, amount: 50, external_id: "small-" + tag },
+    ] }),
+  });
+  const list = await (await apiFetch("/api/transactions?month=2026-09")).json();
+  assert.equal(list.rows.find((r) => r.vendor_raw === "Big Spend " + tag).approval_status, "needed");
+  assert.equal(list.rows.find((r) => r.vendor_raw === "Small Spend " + tag).approval_status, "not_required");
+  await apiFetch("/api/settings/owner-approval-threshold", { method: "PUT", body: JSON.stringify({ value: null }) });
+});
+
+test("captain can approve a flagged transaction, which then unblocks month close", async () => {
+  await apiFetch("/api/settings/owner-approval-threshold", { method: "PUT", body: JSON.stringify({ value: 200 }) });
+  const boot = await (await apiFetch("/api/bootstrap")).json();
+  const month = "2026-04";
+  await apiFetch("/api/transactions", {
+    method: "POST",
+    body: JSON.stringify({ transaction_date: `${month}-05`, vendor_raw: "Approval Flow Vendor", amount: 500, external_id: "test-approval-" + crypto.randomUUID() }),
+  });
+  const list = await (await apiFetch(`/api/transactions?month=${month}`)).json();
+  const tx = list.rows.find((r) => r.vendor_raw === "Approval Flow Vendor");
+  assert.equal(tx.approval_status, "needed");
+
+  const closeBlocked = await apiFetch("/api/close-month", { method: "POST", body: JSON.stringify({ month }) });
+  const blockedBody = await closeBlocked.json();
+  assert.equal(closeBlocked.status, 409);
+  assert.ok(blockedBody.blockers.owner_approval_needed >= 1);
+
+  const approveRes = await apiFetch(`/api/transactions/${tx.id}`, { method: "PATCH", body: JSON.stringify({
+    category_id: boot.categories[0].id, approval_status: "approved", approval_note: "owner said go ahead",
+  }) });
+  assert.equal(approveRes.status, 200);
+  const after = await (await apiFetch(`/api/transactions?month=${month}`)).json();
+  const updated = after.rows.find((r) => r.id === tx.id);
+  assert.equal(updated.approval_status, "approved");
+  assert.equal(updated.approved_by, "captain");
+  assert.ok(updated.approval_date);
+  await apiFetch("/api/settings/owner-approval-threshold", { method: "PUT", body: JSON.stringify({ value: null }) });
+});
+
 // ---- Runner ----
 
 async function run() {
