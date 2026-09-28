@@ -1279,8 +1279,15 @@ async function sendMail({to,subject,text}){
   const user=process.env.GMAIL_USER,pass=process.env.GMAIL_APP_PASSWORD;
   if(!user||!pass){console.log(`[mail not configured] would send to ${to}: ${subject}`);return{sent:false}}
   const transport=nodemailer.createTransport({service:"gmail",auth:{user,pass}});
-  await transport.sendMail({from:`Carbon Copy Accounting <${user}>`,to,subject,text});
-  return{sent:true};
+  // A monitor/alert run that dies because Gmail's SMTP timed out is worse than
+  // one that just fails to send — the DB checks it already ran still matter.
+  try{
+    await transport.sendMail({from:`Carbon Copy Accounting <${user}>`,to,subject,text});
+    return{sent:true};
+  }catch(e){
+    console.error("SEND_MAIL_FAILED",e.message);
+    return{sent:false,error:e.message};
+  }
 }
 
 async function backupDatabase(){
