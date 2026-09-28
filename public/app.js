@@ -41,6 +41,13 @@ async function loadBootstrap(){
   bootstrap=await api('bootstrap');
   renderRules();
   renderReceiptForm();
+  renderMailSettings();
+}
+
+function renderMailSettings(){
+  const from=$('#settingsMailFrom'),to=$('#settingsAlertTo');
+  if(from) from.value=bootstrap.mail_from||'';
+  if(to) to.value=bootstrap.alert_email_to||'';
 }
 
 async function loadDashboard(){
@@ -390,7 +397,7 @@ async function runSystemCheck(){
     catch(e){add(name,false,(e&&e.message)||String(e));}
   };
 
-  const expectedViews=['dashboard','transactions','receipts','import','reports','rules','system'];
+  const expectedViews=['dashboard','transactions','receipts','import','reports','rules','settings','system'];
   await test('Navigation structure',async()=>{
     const missing=expectedViews.filter((id)=>!document.getElementById(id)||!document.querySelector('.nav[data-view="'+id+'"]'));
     if(missing.length) throw new Error('Missing: '+missing.join(', '));
@@ -571,6 +578,22 @@ function wireStaticControls(){
   if($('#addCategory')) $('#addCategory').addEventListener('click',async()=>{
     await api('categories',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name:$('#newCategory').value})});
     $('#newCategory').value='';await loadBootstrap();
+  });
+  if($('#saveMailSettings')) $('#saveMailSettings').addEventListener('click',async()=>{
+    const status=$('#mailSettingsStatus');
+    const mail_from=$('#settingsMailFrom').value.trim();
+    const alert_email_to=$('#settingsAlertTo').value.trim();
+    try{
+      await api('settings/mail',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({
+        mail_from:mail_from||null,
+        alert_email_to:alert_email_to||null
+      })});
+      await loadBootstrap();
+      if(status) status.innerHTML='<p class="ok">Saved.</p>';
+      toast('Email settings saved');
+    }catch(e){
+      if(status) status.innerHTML='<p class="warn">'+esc(e.message)+'</p>';
+    }
   });
   if($('#addRule')) $('#addRule').addEventListener('click',async()=>{
     await api('vendor-rules',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({vendor_pattern:$('#ruleVendor').value,category_id:Number($('#ruleCategory').value)})});
