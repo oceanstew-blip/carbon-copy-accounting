@@ -623,12 +623,15 @@ app.post("/api/ocr",upload.any(),async(req,res,next)=>{try{
 
 
 app.get("/api/bootstrap",async(_req,res,next)=>{try{
-  const [c,cd,r,threshold]=await Promise.all([
+  const [c,cd,r,threshold,mf,ae]=await Promise.all([
     pool.query("SELECT id,name,sort_order FROM categories WHERE active=true ORDER BY sort_order,name"),
     pool.query("SELECT id,label,last4 FROM cards WHERE active=true ORDER BY id"),
     pool.query("SELECT vr.id,vr.vendor_pattern,vr.category_id,c.name category_name FROM vendor_rules vr JOIN categories c ON c.id=vr.category_id ORDER BY vr.vendor_pattern"),
-    pool.query("SELECT value FROM settings WHERE key='owner_approval_threshold'")
-  ]);res.json({categories:c.rows,cards:cd.rows,rules:r.rows,payment_methods:["credit_card","wire","check","cash"],owner_approval_threshold:threshold.rows[0]?Number(threshold.rows[0].value):null})
+    pool.query("SELECT value FROM settings WHERE key='owner_approval_threshold'"),
+    pool.query("SELECT value FROM settings WHERE key='mail_from'"),
+    pool.query("SELECT value FROM settings WHERE key='alert_email_to'")
+  ]);
+  res.json({categories:c.rows,cards:cd.rows,rules:r.rows,payment_methods:["credit_card","wire","check","cash"],owner_approval_threshold:threshold.rows[0]?Number(threshold.rows[0].value):null,mail_from:mf.rows[0]?.value??null,alert_email_to:ae.rows[0]?.value??null})
 }catch(e){next(e)}});
 
 app.put("/api/settings/owner-approval-threshold",async(req,res,next)=>{try{
@@ -639,6 +642,41 @@ app.put("/api/settings/owner-approval-threshold",async(req,res,next)=>{try{
     ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value`,[JSON.stringify(value)]);
   await audit("captain","update","setting","owner_approval_threshold",{value:before},{value},{source:"PUT /api/settings/owner-approval-threshold"});
   res.json({owner_approval_threshold:value});
+}catch(e){next(e)}});
+
+// Lets the client point sends/alerts at their own address (e.g. a Captain's
+// own domain instead of the vessel's default) without a code deploy. Each
+// address must resolve to something that actually looks like an email --
+// either bare ("x@y.com") or "Name <x@y.com>" -- so a typo doesn't silently
+// become the new value the monitor/alert crons send to.
+function extractEmailAddress(s){
+  const m=String(s).match(/<([^>]+)>/);
+  return (m?m[1]:String(s)).trim();
+}
+function isValidEmailValue(s){
+  return typeof s==="string"&&s.trim().length>0&&/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(extractEmailAddress(s));
+}
+app.put("/api/settings/mail",async(req,res,next)=>{try{
+  const {mail_from,alert_email_to}=req.body;
+  if(mail_from===undefined&&alert_email_to===undefined)return res.status(400).json({error:"Provide mail_from and/or alert_email_to"});
+  const updates={};
+  if(mail_from!==undefined){
+    if(mail_from!==null&&!isValidEmailValue(mail_from))return res.status(400).json({error:"mail_from must be a valid email, e.g. 'Carbon Copy Accounting <alerts@yourdomain.com>'"});
+    updates.mail_from=mail_from;
+  }
+  if(alert_email_to!==undefined){
+    if(alert_email_to!==null&&!isValidEmailValue(alert_email_to))return res.status(400).json({error:"alert_email_to must be a valid email address"});
+    updates.alert_email_to=alert_email_to;
+  }
+  const result={};
+  for(const [key,value] of Object.entries(updates)){
+    const before=(await pool.query("SELECT value FROM settings WHERE key=$1",[key])).rows[0]?.value??null;
+    await pool.query(`INSERT INTO settings(key,value) VALUES($1,$2::jsonb)
+      ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value`,[key,JSON.stringify(value)]);
+    await audit("captain","update","setting",key,{value:before},{value},{source:"PUT /api/settings/mail"});
+    result[key]=value;
+  }
+  res.json(result);
 }catch(e){next(e)}});
 
 app.get("/api/dashboard",async(req,res,next)=>{try{
@@ -1271,16 +1309,26 @@ async function legacyReceiptCleanup(){
   console.log("LEGACY_FILENAME_REFRESH complete");
 }
 
-// ponytail: email sending is a no-op (logs instead) until RESEND_API_KEY/
-// MAIL_FROM are set — lets monitoring/backup/alert code be written and wired
-// in now without blocking on the sending account being ready.
+// Captain-editable via settings keys 'mail_from' and 'alert_email_to' (PUT
+// /api/settings/mail) so a client can point sends/alerts at their own address
+// without a redeploy. RESEND_API_KEY stays a Railway-only secret — that's
+// infrastructure, not something to expose in the app's settings UI.
+async function getMailSetting(key,envFallback){
+  const row=(await pool.query("SELECT value FROM settings WHERE key=$1",[key])).rows[0];
+  return row?row.value:(envFallback||null);
+}
+
+// ponytail: email sending is a no-op (logs instead) until RESEND_API_KEY and a
+// from-address are set — lets monitoring/backup/alert code be written and
+// wired in now without blocking on the sending account being ready.
 //
 // Uses Resend's HTTPS API rather than SMTP: Railway's Hobby plan blocks
 // outbound SMTP entirely (silently times out instead of refusing), which is
 // what crashed the monitor/alerts cron jobs. An HTTPS API call isn't subject
 // to that block.
 async function sendMail({to,subject,text}){
-  const apiKey=process.env.RESEND_API_KEY,from=process.env.MAIL_FROM;
+  const apiKey=process.env.RESEND_API_KEY;
+  const from=await getMailSetting("mail_from",process.env.MAIL_FROM);
   if(!apiKey||!from){console.log(`[mail not configured] would send to ${to}: ${subject}`);return{sent:false}}
   try{
     const res=await fetch("https://api.resend.com/emails",{
@@ -1388,8 +1436,8 @@ async function pullReceiptEmails(){
 // approve or decline a large charge, confirm or reject a suspected duplicate,
 // or close out a month that's already clean and waiting.
 async function sendAlertDigest(){
-  const alertTo=process.env.ALERT_EMAIL_TO;
-  if(!alertTo){console.log("ALERTS_SKIPPED: ALERT_EMAIL_TO not configured");return{sent:false}}
+  const alertTo=await getMailSetting("alert_email_to",process.env.ALERT_EMAIL_TO);
+  if(!alertTo){console.log("ALERTS_SKIPPED: alert_email_to not configured");return{sent:false}}
   const approvals=(await pool.query(`SELECT id,transaction_date,vendor_raw,amount FROM transactions
     WHERE approval_status='needed' AND status='posted' ORDER BY transaction_date`)).rows;
   const duplicates=(await pool.query(`SELECT id,transaction_date,vendor_raw,amount FROM transactions
@@ -1457,7 +1505,7 @@ async function runMonitorCheck(){
   const allOk=results.every(r=>r.ok);
   const lines=results.map(r=>`${r.ok?"PASS":"FAIL"} — ${r.name}: ${r.detail}`);
   console.log(`MONITOR_CHECK ${allOk?"PASS":"FAIL"}\n${lines.join("\n")}`);
-  const alertTo=process.env.ALERT_EMAIL_TO;
+  const alertTo=await getMailSetting("alert_email_to",process.env.ALERT_EMAIL_TO);
   if(alertTo){
     await sendMail({
       to:alertTo,
