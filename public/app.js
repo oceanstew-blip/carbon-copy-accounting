@@ -624,6 +624,12 @@ function wireStaticControls(){
     const vendors=(r.topVendors||[]).map((x)=>'<div class="barrow"><span>'+esc(x.name)+'</span><span></span><b>'+money(x.total)+'</b></div>').join('');
     $('#reportOutput').innerHTML='<h2>'+esc(r.label)+'</h2><p><b>Total:</b> '+money(r.summary.total)+' · <b>Transactions:</b> '+r.summary.transaction_count+'</p><div class="grid2"><div><h3>By Category</h3>'+categories+'</div><div><h3>By Payment Method</h3>'+payments+'</div></div><h3>Top Vendors</h3>'+vendors;
   });
+
+  if($('#downloadRegisterXlsx')) $('#downloadRegisterXlsx').addEventListener('click',()=>{
+    const year=Number($('#reportYear').value)||new Date().getFullYear(),m=Number($('#reportMonth').value)||new Date().getMonth()+1;
+    const month=year+'-'+String(m).padStart(2,'0');
+    window.location.href='/api/export/register?format=xlsx&month='+encodeURIComponent(month);
+  });
 }
 
 async function boot(){

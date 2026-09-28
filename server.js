@@ -6,6 +6,7 @@ import sharp from "sharp";
 import { promises as fsp } from "fs";
 import { createWorker, PSM } from "tesseract.js";
 import { AwsClient } from "aws4fetch";
+import ExcelJS from "exceljs";
 import zlib from "zlib";
 import { capitalOneCsv, initialRules, driveReceipts } from "./seed.js";
 
@@ -1191,6 +1192,22 @@ app.get("/api/export/register",async(req,res,next)=>{try{
     WHERE t.status='posted' AND t.transaction_date >= $1::date AND t.transaction_date < $2::date
     ORDER BY t.transaction_date,t.id`,[start,n]);
   const headers=["Transaction Date","Posted Date","Vendor","Amount","Category","Payment Method","Card/Reference","Captain Reviewed","Receipt Attached","Owner Approval Status","Notes"];
+  const toDate=(v)=>v instanceof Date?v.toISOString().slice(0,10):v;
+  if(req.query.format==="xlsx"){
+    const wb=new ExcelJS.Workbook();
+    const sheet=wb.addWorksheet(month);
+    sheet.columns=headers.map((header)=>({header,width:Math.max(header.length+2,14)}));
+    for(const r of q.rows){
+      sheet.addRow([toDate(r.transaction_date),toDate(r.posted_date),r.vendor,Number(r.amount),r.category_name||"Uncategorized",
+        r.payment_method,r.card_or_reference,r.captain_reviewed?"Yes":"No",r.receipt_id?"Yes":"No",r.approval_status,r.notes]);
+    }
+    sheet.getColumn(4).numFmt="0.00";
+    sheet.getRow(1).font={bold:true};
+    res.set("Content-Type","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.set("Content-Disposition",`attachment; filename="carbon-copy-register-${month}.xlsx"`);
+    await wb.xlsx.write(res);
+    return res.end();
+  }
   const lines=[headers.join(",")];
   for(const r of q.rows){
     lines.push([
