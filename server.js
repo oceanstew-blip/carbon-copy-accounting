@@ -6,7 +6,6 @@ import sharp from "sharp";
 import { promises as fsp } from "fs";
 import { createWorker, PSM } from "tesseract.js";
 import { AwsClient } from "aws4fetch";
-import nodemailer from "nodemailer";
 import zlib from "zlib";
 import { capitalOneCsv, initialRules, driveReceipts } from "./seed.js";
 
@@ -1272,17 +1271,24 @@ async function legacyReceiptCleanup(){
   console.log("LEGACY_FILENAME_REFRESH complete");
 }
 
-// ponytail: email sending is a no-op (logs instead) until GMAIL_USER/
-// GMAIL_APP_PASSWORD are set — lets monitoring/backup/alert code be written
-// and wired in now without blocking on the Gmail account being ready.
+// ponytail: email sending is a no-op (logs instead) until RESEND_API_KEY/
+// MAIL_FROM are set — lets monitoring/backup/alert code be written and wired
+// in now without blocking on the sending account being ready.
+//
+// Uses Resend's HTTPS API rather than SMTP: Railway's Hobby plan blocks
+// outbound SMTP entirely (silently times out instead of refusing), which is
+// what crashed the monitor/alerts cron jobs. An HTTPS API call isn't subject
+// to that block.
 async function sendMail({to,subject,text}){
-  const user=process.env.GMAIL_USER,pass=process.env.GMAIL_APP_PASSWORD;
-  if(!user||!pass){console.log(`[mail not configured] would send to ${to}: ${subject}`);return{sent:false}}
-  const transport=nodemailer.createTransport({service:"gmail",auth:{user,pass}});
-  // A monitor/alert run that dies because Gmail's SMTP timed out is worse than
-  // one that just fails to send — the DB checks it already ran still matter.
+  const apiKey=process.env.RESEND_API_KEY,from=process.env.MAIL_FROM;
+  if(!apiKey||!from){console.log(`[mail not configured] would send to ${to}: ${subject}`);return{sent:false}}
   try{
-    await transport.sendMail({from:`Carbon Copy Accounting <${user}>`,to,subject,text});
+    const res=await fetch("https://api.resend.com/emails",{
+      method:"POST",
+      headers:{Authorization:`Bearer ${apiKey}`,"Content-Type":"application/json"},
+      body:JSON.stringify({from,to:[to],subject,text}),
+    });
+    if(!res.ok)throw new Error(`Resend ${res.status}: ${await res.text()}`);
     return{sent:true};
   }catch(e){
     console.error("SEND_MAIL_FAILED",e.message);
