@@ -45,3 +45,4 @@ None — no photos, logo, or other real assets currently available or planned fo
 3. **Exceptions should be impossible to miss** — the product's whole value is catching what generic tools silently drop (duplicates, missing receipts, unreviewed transactions); the design should make those states visually loud, not buried in a muted gray row.
 4. **Marine, not maritime-cute** — the vessel context is real (captain, vessel, statement, dockage) but the audience is a working captain, not a tourist; avoid anchor-emoji/nautical-kitsch treatment.
 5. **Nothing invented** — no fabricated data, testimonials, or decorative photography; every number on screen is real.
+
