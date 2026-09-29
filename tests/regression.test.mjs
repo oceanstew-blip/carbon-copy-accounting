@@ -11,6 +11,7 @@
 import assert from "node:assert/strict";
 import { execSync } from "node:child_process";
 import crypto from "node:crypto";
+import ExcelJS from "exceljs";
 
 const APP_PORT = Number(process.env.PORT || 8321);
 const BASE = `http://127.0.0.1:${APP_PORT}`;
@@ -536,17 +537,26 @@ test("monthly register export is a CSV with the expected columns and a known row
   assert.match(text, new RegExp(`Export Test Vendor ${tag}`));
 });
 
-test("monthly register export supports an xlsx download for the accountant", async () => {
+test("monthly register export supports an xlsx download for the accountant, with columns wide enough to show full vendor/category text", async () => {
   const tag = crypto.randomUUID();
+  const longVendor = "A Very Long Provisioning Vendor Name That Would Get Clipped " + tag;
   await apiFetch("/api/transactions", {
     method: "POST",
-    body: JSON.stringify({ transaction_date: "2026-09-24", vendor_raw: "Export Xlsx Vendor " + tag, amount: 12.34, external_id: "test-export-xlsx-" + tag }),
+    body: JSON.stringify({ transaction_date: "2026-09-24", vendor_raw: longVendor, amount: 12.34, external_id: "test-export-xlsx-" + tag }),
   });
   const res = await apiFetch("/api/export/register?month=2026-09&format=xlsx");
   assert.equal(res.status, 200);
   assert.match(res.headers.get("content-type"), /spreadsheetml/);
   const buf = Buffer.from(await res.arrayBuffer());
   assert.equal(buf.slice(0, 2).toString("hex"), "504b", "xlsx files are zip archives (PK header)");
+
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(buf);
+  const sheet = wb.worksheets[0];
+  const row = sheet.getRows(2, sheet.rowCount - 1).find((r) => r.getCell(3).value === longVendor);
+  assert.ok(row, "the long-vendor row should be present, unmodified");
+  const vendorColWidth = sheet.getColumn(3).width;
+  assert.ok(vendorColWidth >= longVendor.length, `vendor column (width ${vendorColWidth}) should be wide enough to show the full name (${longVendor.length} chars)`);
 });
 
 test("exception report lists uncategorized and unreviewed transactions", async () => {

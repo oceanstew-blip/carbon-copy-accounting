@@ -1203,6 +1203,11 @@ app.get("/api/export/register",async(req,res,next)=>{try{
     }
     sheet.getColumn(4).numFmt="0.00";
     sheet.getRow(1).font={bold:true};
+    sheet.columns.forEach((col)=>{
+      let max=col.header.length;
+      col.eachCell({includeEmpty:true},(cell)=>{max=Math.max(max,cell.value?String(cell.value).length:0)});
+      col.width=col.header==="Notes"?Math.min(max+2,60):max+2;
+    });
     res.set("Content-Type","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
     res.set("Content-Disposition",`attachment; filename="carbon-copy-register-${month}.xlsx"`);
     await wb.xlsx.write(res);
