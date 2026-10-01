@@ -4,7 +4,7 @@ import pg from "pg";
 import crypto from "crypto";
 import sharp from "sharp";
 import { promises as fsp } from "fs";
-import { ocrRaw, interpretRaw, combineRaws, groupLoosePhotos, toReadable, isHeic, getOcrWorker, isoReceiptDate, amountFromLine, detectPaymentMethodFromText, suggestedCategoryFromText, labeledAmount, parseOcrReceipt, mergeOcrFields, chooseBestAmount, ocrImage } from "./ocr.js";
+import { ocrRaw, interpretRaw, combineRaws, groupLoosePhotos, pdfToImages, toReadable, isHeic, getOcrWorker, isoReceiptDate, amountFromLine, detectPaymentMethodFromText, suggestedCategoryFromText, labeledAmount, parseOcrReceipt, mergeOcrFields, chooseBestAmount, ocrImage } from "./ocr.js";
 import { AwsClient } from "aws4fetch";
 import ExcelJS from "exceljs";
 import zlib from "zlib";
@@ -426,8 +426,10 @@ app.get("/api/ocr/self-test",async(_req,res,next)=>{try{
 app.post("/api/ocr",upload.any(),async(req,res,next)=>{try{
   const files=req.files||[];if(!files.length)return res.status(400).json({error:"Receipt image required"});
   if(files.some((f)=>f.mimetype==="application/pdf")){
-    if(files.length>1)return res.status(422).json({error:"Multi-page bundles currently support image photos only. Upload PDF receipts one at a time."});
-    return res.status(422).json({error:"PDF OCR is not enabled yet. You can still enter the receipt fields manually."});
+    if(files.length>1)return res.status(422).json({error:"Upload a PDF receipt on its own, or several photos together."});
+    const {images}=pdfToImages(files[0].buffer);const raws=[];
+    for(const img of images)raws.push(await ocrRaw(img));
+    return res.json({...interpretRaw(raws.length===1?raws[0]:combineRaws(raws)),page_count:images.length});
   }
   const allowed=["image/jpeg","image/png","image/webp","image/heic","image/heif","application/octet-stream"];
   if(files.some((f)=>!allowed.includes(f.mimetype)))return res.status(415).json({error:"OCR supports JPG, PNG, WEBP, HEIC and HEIF images"});
@@ -818,7 +820,11 @@ app.post("/api/receipts/:id/ocr",async(req,res,next)=>{try{
   const r=(await pool.query("SELECT file_name,content_type,file_data,purged_at FROM receipts WHERE id=$1",[id])).rows[0];
   if(!r)return res.status(404).json({error:"Receipt not found"});
   if(r.purged_at||!r.file_data)return res.status(410).json({error:"Receipt image is no longer available"});
-  if(r.content_type==="application/pdf")return res.status(422).json({error:"PDF re-reading is not enabled yet"});
+  if(r.content_type==="application/pdf"){
+    const {images}=pdfToImages(r.file_data);const raws=[];
+    for(const img of images)raws.push(await ocrRaw(img));
+    return res.json(interpretRaw(raws.length===1?raws[0]:combineRaws(raws)));
+  }
   if(!String(r.content_type||"").startsWith("image/")&&!/heic|heif|octet-stream/i.test(String(r.content_type||"")))return res.status(415).json({error:"This receipt type cannot be re-read automatically"});
   const out=await ocrImage(r.file_data);
   res.json(out);
@@ -1230,6 +1236,10 @@ async function backupDatabase(){
 async function ingestReceiptFromEmail(buffer,mimetype,filename){
   const allowed=["image/jpeg","image/png","image/webp","image/heic","image/heif","application/pdf"];
   if(!allowed.includes(mimetype))return{skipped:true,reason:`unsupported type ${mimetype}`};
+  if(mimetype==="application/pdf"){
+    try{const r=await ingestPdf(buffer,filename||"receipt.pdf");return r.status==="duplicate"?{skipped:true,reason:"duplicate",id:r.id}:{skipped:false,id:r.id,matched_transaction_id:r.matched_transaction_id}}
+    catch(e){console.error("EMAIL_PDF_FAILED",e.message);return{skipped:true,reason:"pdf could not be read"}}
+  }
   const sha=crypto.createHash("sha256").update(buffer).digest("hex");
   const existing=(await pool.query("SELECT id FROM receipts WHERE file_sha256=$1",[sha])).rows[0];
   if(existing)return{skipped:true,reason:"duplicate",id:existing.id};
@@ -1257,16 +1267,17 @@ function typeOfName(name,fallback){return IMG_TYPES[String(name).toLowerCase().m
 function interpretPages(raws,totalIdx){return interpretRaw(raws.length===1?raws[0]:combineRaws(raws,totalIdx))}
 
 // pages: [{buffer,name,sha,raw}] (raw = ocrRaw result or null). Saves one receipt + its pages.
-async function saveReceiptPages(pages,{autoGrouped=false}={}){
-  const groupSha=pages.length===1?pages[0].sha:sha256(pages.map((p)=>p.sha).join(""));
+async function saveReceiptPages(pages,{autoGrouped=false,original=null,extraReasons=[]}={}){
+  const groupSha=original?sha256(original.buffer):pages.length===1?pages[0].sha:sha256(pages.map((p)=>p.sha).join(""));
   const dup=(await pool.query("SELECT id FROM receipts WHERE file_sha256=$1",[groupSha])).rows[0];
   if(dup)return{status:"duplicate",id:dup.id};
   const raws=pages.map((p)=>p.raw).filter(Boolean);
   let d={vendor:null,receipt_date:null,amount:null,suggested_category:null,detected_payment_method:null,receipt_text:null,confidence:null,field_score:null,review_reasons:[]};
   if(raws.length===pages.length)d=interpretPages(raws);
   const reasons=[...(d.review_reasons||[])];
-  if(pages.length>1)reasons.push(autoGrouped?"photos grouped automatically":"multi-photo receipt");
-  const combined=await combineReceiptImages(pages.map((p)=>({buffer:p.buffer,mimetype:typeOfName(p.name,"image/jpeg"),originalname:p.name})));
+  if(pages.length>1)reasons.push(original?"multi-page PDF":autoGrouped?"photos grouped automatically":"multi-photo receipt");
+  reasons.push(...extraReasons);
+  const combined=original?{buffer:original.buffer,content_type:original.mime,file_name:original.name}:await combineReceiptImages(pages.map((p)=>({buffer:p.buffer,mimetype:typeOfName(p.name,"image/jpeg"),originalname:p.name})));
   const mime=combined.content_type,full=combined.buffer;
   const pay=(d.detected_payment_method&&d.detected_payment_method!=="credit_card")?d.detected_payment_method:"credit_card";
   const finalName=receiptFileName(d.vendor,d.receipt_date,d.amount,mime,combined.file_name||pages[0].name);
@@ -1283,6 +1294,18 @@ async function saveReceiptPages(pages,{autoGrouped=false}={}){
   }catch(e){await client.query("ROLLBACK");throw e}finally{client.release()}
   const matched=pay==="credit_card"?await autoMatchReceipt(id):null;
   return{status:"ingested",id,pages:pages.length,matched_transaction_id:matched};
+}
+
+// A scanner-app PDF is one receipt; its pages are rendered and read like photos. The PDF itself is what gets filed.
+async function ingestPdf(buffer,name){
+  const {images,truncated,total}=pdfToImages(buffer);
+  const base=String(name).replace(/\.pdf$/i,"");
+  const pages=[];
+  for(const [i,img] of images.entries()){
+    let raw=null;try{raw=await ocrRaw(img)}catch(e){console.error("INBOX_OCR_FAILED",name,e.message)}
+    pages.push({buffer:img,name:`${base}-p${i+1}.jpg`,sha:sha256(img),raw});
+  }
+  return saveReceiptPages(pages,{original:{buffer,mime:"application/pdf",name},extraReasons:truncated?[`PDF has ${total} pages, only the first ${images.length} were read`]:[]});
 }
 
 async function readPages(files){
@@ -1315,8 +1338,7 @@ app.post("/api/receipts/inbox",upload.any(),async(req,res,next)=>{try{
     const gf=g.map((i)=>files[i]),names=gf.map((f)=>f.originalname);
     try{
       if(gf.length===1&&/\.pdf$/i.test(names[0])){
-        const r=await ingestReceiptFromEmail(gf[0].buffer,"application/pdf",names[0]);
-        results.push({files:names,status:r.skipped?(r.reason==="duplicate"?"duplicate":"error"):"ingested",id:r.id,error:r.skipped&&r.reason!=="duplicate"?r.reason:undefined});
+        results.push({files:names,...await ingestPdf(gf[0].buffer,names[0])});
       }else{
         const r=await saveReceiptPages(await readPages(gf),{autoGrouped:req.body.mode!=="folder"&&gf.length>1});
         results.push({files:names,...r});

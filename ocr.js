@@ -1,5 +1,6 @@
 import sharp from "sharp";
 import heicConvert from "heic-convert";
+import * as mupdf from "mupdf";
 import { createWorker, PSM } from "tesseract.js";
 
 let ocrWorkerPromise=null;
@@ -315,4 +316,16 @@ export function groupLoosePhotos(items,{gapMs=30000,maxPages=6}={}){
   }
   if(cur.length)groups.push(cur);
   return groups.map((g)=>g.map((x)=>x.i));
+}
+
+// Scanner-app PDFs (CamScanner etc.): render each page to an image so the normal photo OCR can read it.
+// ponytail: renders at ~200dpi, max 12 pages; a longer PDF is cut off and the caller is told via truncated.
+export function pdfToImages(buffer,{maxPages=12,dpi=200}={}){
+  const doc=mupdf.Document.openDocument(buffer,"application/pdf");
+  const total=doc.countPages(),n=Math.min(total,maxPages),out=[];
+  for(let i=0;i<n;i++){
+    const pix=doc.loadPage(i).toPixmap(mupdf.Matrix.scale(dpi/72,dpi/72),mupdf.ColorSpace.DeviceRGB,false,true);
+    out.push(Buffer.from(pix.asJPEG(88,false)));
+  }
+  return{images:out,truncated:total>n,total};
 }

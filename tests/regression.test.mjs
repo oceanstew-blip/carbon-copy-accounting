@@ -770,6 +770,34 @@ test("HEIC (iPhone) photos are converted and read, via /api/ocr and the folder i
   assert.ok(Math.abs(Number(row.amount) - 87.46) < 0.02);
 });
 
+test("scanner-app PDFs: read via /api/ocr and the folder inbox; multi-page PDF is one receipt with pages", async () => {
+  const { readFileSync } = await import("node:fs");
+  const one = readFileSync(new URL("./fixtures/ocr-self-test-receipt.pdf", import.meta.url));
+  const two = readFileSync(new URL("./fixtures/two-page.pdf", import.meta.url));
+  const f1 = new FormData();
+  f1.append("files", new Blob([one], { type: "application/pdf" }), "scan.pdf");
+  let r = await fetch(BASE + "/api/ocr", { method: "POST", headers: { Authorization: AUTH }, body: f1 });
+  assert.equal(r.status, 200);
+  assert.ok(Math.abs(Number((await r.json()).amount) - 87.46) < 0.02);
+  const f2 = new FormData();
+  f2.append("mode", "auto");
+  f2.append("files", new Blob([two], { type: "application/pdf" }), "Scan 2026-09-29.pdf");
+  r = await fetch(BASE + "/api/receipts/inbox", { method: "POST", headers: { Authorization: AUTH }, body: f2 });
+  const g = (await r.json()).groups[0];
+  assert.equal(g.status, "ingested");
+  assert.equal(g.pages, 2);
+  const row = (await pool.query("SELECT amount,content_type,ocr_review_reasons FROM receipts WHERE id=$1", [g.id])).rows[0];
+  assert.equal(row.content_type, "application/pdf");
+  assert.ok(Math.abs(Number(row.amount) - 87.46) < 0.02);
+  assert.match(row.ocr_review_reasons, /multi-page PDF/);
+  assert.equal((await (await apiFetch(`/api/receipts/${g.id}/pages`)).json()).pages.length, 2);
+  const again = new FormData();
+  again.append("mode", "auto");
+  again.append("files", new Blob([two], { type: "application/pdf" }), "Scan 2026-09-29.pdf");
+  r = await fetch(BASE + "/api/receipts/inbox", { method: "POST", headers: { Authorization: AUTH }, body: again });
+  assert.equal((await r.json()).groups[0].status, "duplicate");
+});
+
 async function run() {
   await setup();
   let pass = 0, fail = 0;

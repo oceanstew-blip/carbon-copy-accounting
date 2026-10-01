@@ -348,11 +348,9 @@ async function runReceiptOcr(files){
   if(!list.length||!status)return;
   status.className='muted';
   status.textContent='Reading '+list.length+' receipt image'+(list.length>1?'s':'')+'…';
-  if(list.some((f)=>f.type==='application/pdf'||/\.pdf$/i.test(f.name||''))){
+  if(list.length>1&&list.some((f)=>/pdf/i.test(f.type)||/\.pdf$/i.test(f.name||''))){
     status.className='warn';
-    status.textContent=list.length>1
-      ? 'Multi-image bundles currently support photos only. PDFs must be reviewed separately.'
-      : 'PDF attached. OCR is not enabled for PDFs yet. Review and enter the fields manually before saving.';
+    status.textContent='Upload a PDF receipt on its own, or several photos together.';
     return;
   }
   const fd=new FormData();list.forEach((f)=>fd.append('files',f));
