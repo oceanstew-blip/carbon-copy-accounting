@@ -8,14 +8,14 @@
 #     another photo taken seconds earlier (IMG_2041, IMG_2042) - those are suggested as one long receipt.
 #   - A SUBFOLDER is always exactly one receipt (put all photos of a long receipt in it).
 #   - Uploaded files are moved to Done\. Anything that fails stays put and is retried.
-param([switch]$Setup)
+param([switch]$Setup,[switch]$Once)  # -Once = one pass then exit (testing)
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Net.Http
 $Here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ConfigPath = Join-Path $Here 'config.json'
 $LogPath = Join-Path $Here 'watcher.log'
 $Exts = '.jpg','.jpeg','.png','.webp','.heic','.heif','.pdf'
-$SettleSeconds = 45   # file must be this old (finished syncing/copying) before upload
+$SettleSeconds = $(if ($env:WATCHER_SETTLE) { [int]$env:WATCHER_SETTLE } else { 45 })   # file must be this old (finished syncing/copying) before upload
 
 function Log($m) { Add-Content -Path $LogPath -Value ("{0}  {1}" -f (Get-Date -Format 's'), $m) }
 
@@ -36,8 +36,11 @@ if ($Setup) {
 }
 
 $cfg = Get-Content $ConfigPath -Raw | ConvertFrom-Json
-$bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR(($cfg.pass | ConvertTo-SecureString))
-$password = [Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
+# pass_plain is for testing on a non-Windows machine only; setup always writes the encrypted 'pass'.
+if ($cfg.pass_plain) { $password = $cfg.pass_plain } else {
+  $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR(($cfg.pass | ConvertTo-SecureString))
+  $password = [Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
+}
 $root = $cfg.folder
 $doneRoot = Join-Path $root 'Done'
 New-Item -ItemType Directory -Force -Path $doneRoot | Out-Null
@@ -56,7 +59,8 @@ function Send-Files($files, $mode) {
     $part = New-Object System.Net.Http.ByteArrayContent(, [IO.File]::ReadAllBytes($f.FullName))
     $form.Add($part, 'files', $f.Name)
   }
-  $resp = $http.PostAsync("$($cfg.url)/api/receipts/inbox", $form).Result
+  try { $resp = $http.PostAsync("$($cfg.url)/api/receipts/inbox", $form).GetAwaiter().GetResult() }
+  catch { throw "Cannot reach $($cfg.url): $($_.Exception.Message)" }
   $body = $resp.Content.ReadAsStringAsync().Result
   if (-not $resp.IsSuccessStatusCode) { throw "Server said $([int]$resp.StatusCode): $body" }
   return ($body | ConvertFrom-Json)
@@ -103,5 +107,6 @@ while ($true) {
     $loose = @(Get-ChildItem -LiteralPath $root -File | Where-Object { ($Exts -contains $_.Extension.ToLower()) -and (Is-Ready $_) })
     Process-Batch $loose 'auto' $null
   } catch { Log "LOOP ERROR: $($_.Exception.Message)" }
+  if ($Once) { break }
   Start-Sleep -Seconds 20
 }

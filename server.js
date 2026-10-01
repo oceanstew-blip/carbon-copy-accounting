@@ -3,6 +3,7 @@ import multer from "multer";
 import pg from "pg";
 import crypto from "crypto";
 import sharp from "sharp";
+import { withVision } from "./vision.js";
 import { promises as fsp } from "fs";
 import { ocrRaw, interpretRaw, combineRaws, groupLoosePhotos, pdfToImages, toReadable, isHeic, getOcrWorker, isoReceiptDate, amountFromLine, detectPaymentMethodFromText, suggestedCategoryFromText, labeledAmount, parseOcrReceipt, mergeOcrFields, chooseBestAmount, ocrImage } from "./ocr.js";
 import { AwsClient } from "aws4fetch";
@@ -429,13 +430,13 @@ app.post("/api/ocr",upload.any(),async(req,res,next)=>{try{
     if(files.length>1)return res.status(422).json({error:"Upload a PDF receipt on its own, or several photos together."});
     const {images}=pdfToImages(files[0].buffer);const raws=[];
     for(const img of images)raws.push(await ocrRaw(img));
-    return res.json({...interpretRaw(raws.length===1?raws[0]:combineRaws(raws)),page_count:images.length});
+    return res.json({...await withVision(interpretRaw(raws.length===1?raws[0]:combineRaws(raws)),images),page_count:images.length});
   }
   const allowed=["image/jpeg","image/png","image/webp","image/heic","image/heif","application/octet-stream"];
   if(files.some((f)=>!allowed.includes(f.mimetype)))return res.status(415).json({error:"OCR supports JPG, PNG, WEBP, HEIC and HEIF images"});
   const raws=[];
   for(const f of files)raws.push(await ocrRaw(f.buffer));
-  const data=interpretRaw(raws.length===1?raws[0]:combineRaws(raws));
+  const data=await withVision(interpretRaw(raws.length===1?raws[0]:combineRaws(raws)),await Promise.all(files.map((f)=>toReadable(f.buffer))));
   res.json({...data,page_count:files.length});
 }catch(e){next(e)}});
 
@@ -823,10 +824,10 @@ app.post("/api/receipts/:id/ocr",async(req,res,next)=>{try{
   if(r.content_type==="application/pdf"){
     const {images}=pdfToImages(r.file_data);const raws=[];
     for(const img of images)raws.push(await ocrRaw(img));
-    return res.json(interpretRaw(raws.length===1?raws[0]:combineRaws(raws)));
+    return res.json(await withVision(interpretRaw(raws.length===1?raws[0]:combineRaws(raws)),images));
   }
   if(!String(r.content_type||"").startsWith("image/")&&!/heic|heif|octet-stream/i.test(String(r.content_type||"")))return res.status(415).json({error:"This receipt type cannot be re-read automatically"});
-  const out=await ocrImage(r.file_data);
+  const out=await withVision(await ocrImage(r.file_data),[r.file_data]);
   res.json(out);
 }catch(e){next(e)}});
 
@@ -1273,7 +1274,7 @@ async function saveReceiptPages(pages,{autoGrouped=false,original=null,extraReas
   if(dup)return{status:"duplicate",id:dup.id};
   const raws=pages.map((p)=>p.raw).filter(Boolean);
   let d={vendor:null,receipt_date:null,amount:null,suggested_category:null,detected_payment_method:null,receipt_text:null,confidence:null,field_score:null,review_reasons:[]};
-  if(raws.length===pages.length)d=interpretPages(raws);
+  if(raws.length===pages.length)d=await withVision(interpretPages(raws),pages.map((p)=>p.buffer));
   const reasons=[...(d.review_reasons||[])];
   if(pages.length>1)reasons.push(original?"multi-page PDF":autoGrouped?"photos grouped automatically":"multi-photo receipt");
   reasons.push(...extraReasons);

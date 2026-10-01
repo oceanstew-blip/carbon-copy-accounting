@@ -798,6 +798,39 @@ test("scanner-app PDFs: read via /api/ocr and the folder inbox; multi-page PDF i
   assert.equal((await r.json()).groups[0].status, "duplicate");
 });
 
+test("vision second read: fills fields, flags disagreement with Tesseract, and falls back cleanly on API failure", async () => {
+  const http = await import("node:http");
+  const { readFileSync } = await import("node:fs");
+  const { applyVision } = await import("../vision.js");
+  // unit: agreement is corroborated, disagreement is flagged, nothing silently wins
+  const tess = { vendor: "X", receipt_date: null, amount: 55.5, review_reasons: ["date", "total unverified"], suggested_category: "Fuel & Lubricants" };
+  let o = applyVision(tess, { vendor: "WAWA", receipt_date: "2026-09-01", amount: 55.5, subtotal: null, tax: null, detected_payment_method: "credit_card" });
+  assert.equal(o.vendor, "WAWA"); assert.equal(o.total_corroborated, true);
+  assert.ok(!o.review_reasons.includes("date") && !o.review_reasons.includes("total unverified"));
+  o = applyVision(tess, { vendor: "WAWA", receipt_date: "2026-09-01", amount: 55.58, subtotal: null, tax: null, detected_payment_method: null });
+  assert.equal(o.amount, 55.58); assert.ok(o.review_reasons.includes("total disagrees with second read"));
+  // integration: stub Anthropic API
+  let mode = "ok";
+  const srv = http.createServer((req, res) => {
+    req.resume(); req.on("end", () => {
+      if (mode === "fail") { res.statusCode = 500; return res.end("{}"); }
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ content: [{ type: "text", text: JSON.stringify({ vendor: "Vision Marine", date: "2026-09-26", total: 87.46, subtotal: 80, tax: 7.46, payment_method: "credit_card", card_last4: null, total_page: 1 }) }] }));
+    });
+  });
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  process.env.ANTHROPIC_API_KEY = "test"; process.env.ANTHROPIC_BASE_URL = `http://127.0.0.1:${srv.address().port}`;
+  try {
+    const png = readFileSync(new URL("./fixtures/ocr-self-test-receipt.png", import.meta.url));
+    const ask = async () => { const f = new FormData(); f.append("files", new Blob([png]), "r.png"); const r = await fetch(BASE + "/api/ocr", { method: "POST", headers: { Authorization: AUTH }, body: f }); assert.equal(r.status, 200); return r.json(); };
+    let d = await ask();
+    assert.equal(d.vendor, "Vision Marine"); assert.equal(d.total_corroborated, true);
+    mode = "fail";
+    d = await ask();
+    assert.match(d.vendor, /HARBOR/); assert.ok(Math.abs(d.amount - 87.46) < 0.02);
+  } finally { delete process.env.ANTHROPIC_API_KEY; delete process.env.ANTHROPIC_BASE_URL; srv.close(); }
+});
+
 async function run() {
   await setup();
   let pass = 0, fail = 0;
