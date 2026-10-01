@@ -11,6 +11,7 @@
 import assert from "node:assert/strict";
 import { execSync } from "node:child_process";
 import crypto from "node:crypto";
+import { parseOcrReceipt, isoReceiptDate, detectPaymentMethodFromText } from "../ocr.js";
 import ExcelJS from "exceljs";
 
 const APP_PORT = Number(process.env.PORT || 8321);
@@ -659,6 +660,115 @@ test("ACME/domain-verification challenge path is reachable without auth", async 
 });
 
 // ---- Runner ----
+
+// ---- OCR reading rules (from the labeled-receipt scorecard, evals/) ----
+
+test("ocr: total ignores the GST summary block and reads the real total", () => {
+  const text = ["LIM SENG THO HARDWARE TRADING", "Date : 02/02/2018 10:06", "Subtotal : 7.00", "Total Incl. of GST 7.00",
+    "Payment : 7.00", "Change Due : 0.00", "GST Summary Amount(RM) Tax(RM)", "SR @ 6% 6.60 0.40"].join("\n");
+  assert.equal(parseOcrReceipt(text).amount, 7);
+});
+
+test("ocr: a tax-included note is not the total", () => {
+  const text = ["KING'S CONFECTIONERY S/B", "Due 25.15", "Pay 25.15", "Change 0.00", "(Total Included GST @ 6% : 1.42)"].join("\n");
+  assert.equal(parseOcrReceipt(text).amount, 25.15);
+});
+
+test("ocr: day-first dates are read when month-first is impossible, month-first wins when ambiguous", () => {
+  assert.equal(isoReceiptDate("20/03/2018 7:07pm"), "2018-03-20");
+  assert.equal(isoReceiptDate("22 Mar 2018 18:24"), "2018-03-22");
+  assert.equal(isoReceiptDate("9/8/2026 10:25 AM"), "2026-09-08");
+});
+
+test("ocr: cash and masked-card payments are detected", () => {
+  assert.equal(detectPaymentMethodFromText("Total 12.25\nCASH 50.00\nChange 37.75"), "cash");
+  assert.equal(detectPaymentMethodFromText("MASTERCARD XXXXXXXXXXXX0945 43.96"), "credit_card");
+});
+
+test("ocr: vendor is the business name, not OCR junk above it", () => {
+  const text = ["tan woon yann", "BOOK TA .K (TAMAN DAYA) SDN BHD", "789417-W"].join("\n");
+  assert.match(parseOcrReceipt(text).vendor, /SDN BHD/);
+});
+
+test("saving a receipt keeps the OCR guess, and /api/ocr/corrections shows what the captain changed", async () => {
+  const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64");
+  const fd = new FormData();
+  fd.append("files", new Blob([png], { type: "image/png" }), "guess-test-" + crypto.randomUUID() + ".png");
+  fd.append("receipt_date", "2026-09-15"); fd.append("vendor", "Corrections Test Marine"); fd.append("amount", "12.34");
+  fd.append("payment_method", "cash");
+  fd.append("ocr_guess", JSON.stringify({ vendor: "Corections Test Marne", date: "2026-09-15", amount: 12.31, payment: "cash" }));
+  const saved = await fetch(BASE + "/api/receipts", { method: "POST", headers: { Authorization: AUTH }, body: fd });
+  assert.equal(saved.status, 201);
+  const out = await (await apiFetch("/api/ocr/corrections")).json();
+  const row = out.rows.find((r) => r.final.vendor === "Corrections Test Marine");
+  assert.deepEqual(row.changed.sort(), ["total", "vendor"]);
+});
+
+
+test("folder inbox: loose consecutive photos group into one flagged receipt; total-photo tap and split work", async () => {
+  const sharp = (await import("sharp")).default;
+  const { readFileSync } = await import("node:fs");
+  const png = readFileSync(new URL("./fixtures/ocr-self-test-receipt.png", import.meta.url));
+  const variant = await sharp(png).extend({ bottom: 6, background: "white" }).png().toBuffer();
+  const form = new FormData();
+  form.append("mode", "auto");
+  form.append("mtimes", JSON.stringify([1000000, 1005000]));
+  form.append("files", new Blob([png]), "IMG_3001.png");
+  form.append("files", new Blob([variant]), "IMG_3002.png");
+  let r = await fetch(BASE + "/api/receipts/inbox", { method: "POST", headers: { Authorization: AUTH }, body: form });
+  assert.equal(r.status, 200);
+  let out = await r.json();
+  assert.equal(out.groups.length, 1);
+  assert.equal(out.groups[0].status, "ingested");
+  assert.equal(out.groups[0].pages, 2);
+  const id = out.groups[0].id;
+  const row = (await pool.query("SELECT ocr_review_reasons,review_required FROM receipts WHERE id=$1", [id])).rows[0];
+  assert.match(row.ocr_review_reasons, /photos grouped automatically/);
+  assert.equal(row.review_required, true);
+  r = await apiFetch(`/api/receipts/${id}/pages`);
+  assert.equal((await r.json()).pages.length, 2);
+  r = await apiFetch(`/api/receipts/${id}/total-page`, { method: "POST", body: JSON.stringify({ page: 1 }) });
+  assert.equal(r.status, 200);
+  assert.ok(Math.abs(Number((await r.json()).amount) - 87.46) < 0.02);
+  // same files again = duplicate, nothing new
+  const again = new FormData();
+  again.append("mode", "auto"); again.append("mtimes", JSON.stringify([1000000, 1005000]));
+  again.append("files", new Blob([png]), "IMG_3001.png"); again.append("files", new Blob([variant]), "IMG_3002.png");
+  r = await fetch(BASE + "/api/receipts/inbox", { method: "POST", headers: { Authorization: AUTH }, body: again });
+  assert.equal((await r.json()).groups[0].status, "duplicate");
+  r = await apiFetch(`/api/receipts/${id}/split`, { method: "POST", body: JSON.stringify({ after: 1 }) });
+  assert.equal(r.status, 200);
+  const sp = (await r.json()).receipts;
+  assert.equal(sp.length, 2);
+  assert.equal((await pool.query("SELECT 1 FROM receipts WHERE id=$1", [id])).rowCount, 0);
+  const folder = new FormData();
+  folder.append("mode", "folder");
+  folder.append("files", new Blob([await sharp(png).extend({ top: 9, background: "white" }).png().toBuffer()]), "a.png");
+  folder.append("files", new Blob([await sharp(png).extend({ top: 11, background: "white" }).png().toBuffer()]), "b.png");
+  r = await fetch(BASE + "/api/receipts/inbox", { method: "POST", headers: { Authorization: AUTH }, body: folder });
+  out = await r.json();
+  assert.equal(out.groups.length, 1);
+  assert.equal(out.groups[0].pages, 2);
+});
+
+test("HEIC (iPhone) photos are converted and read, via /api/ocr and the folder inbox", async () => {
+  const { readFileSync } = await import("node:fs");
+  const heic = readFileSync(new URL("./fixtures/ocr-self-test-receipt.heic", import.meta.url));
+  const form = new FormData();
+  form.append("files", new Blob([heic]), "IMG_9001.HEIC");
+  let r = await fetch(BASE + "/api/ocr", { method: "POST", headers: { Authorization: AUTH }, body: form });
+  assert.equal(r.status, 200);
+  assert.ok(Math.abs(Number((await r.json()).amount) - 87.46) < 0.02);
+  const f2 = new FormData();
+  f2.append("mode", "folder");
+  f2.append("files", new Blob([heic]), "IMG_9002.HEIC");
+  r = await fetch(BASE + "/api/receipts/inbox", { method: "POST", headers: { Authorization: AUTH }, body: f2 });
+  const g = (await r.json()).groups[0];
+  assert.equal(g.status, "ingested");
+  const row = (await pool.query("SELECT amount,content_type FROM receipts WHERE id=$1", [g.id])).rows[0];
+  assert.equal(row.content_type, "image/jpeg");
+  assert.ok(Math.abs(Number(row.amount) - 87.46) < 0.02);
+});
 
 async function run() {
   await setup();

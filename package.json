@@ -20,6 +20,7 @@
     "aws4fetch": "^1.0.20",
     "exceljs": "^4.4.0",
     "express": "^5.1.0",
+    "heic-convert": "^2.1.0",
     "imapflow": "^2.0.8",
     "mailparser": "^3.9.28",
     "multer": "^2.0.2",

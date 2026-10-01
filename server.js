@@ -4,11 +4,14 @@ import pg from "pg";
 import crypto from "crypto";
 import sharp from "sharp";
 import { promises as fsp } from "fs";
-import { createWorker, PSM } from "tesseract.js";
+import { ocrRaw, interpretRaw, combineRaws, groupLoosePhotos, toReadable, isHeic, getOcrWorker, isoReceiptDate, amountFromLine, detectPaymentMethodFromText, suggestedCategoryFromText, labeledAmount, parseOcrReceipt, mergeOcrFields, chooseBestAmount, ocrImage } from "./ocr.js";
 import { AwsClient } from "aws4fetch";
 import ExcelJS from "exceljs";
 import zlib from "zlib";
+import { readFileSync } from "node:fs";
 import { capitalOneCsv, initialRules, driveReceipts } from "./seed.js";
+// One config file per boat; everything vessel-specific reads from here.
+const V=JSON.parse(readFileSync(new URL("./vessel.config.json",import.meta.url),"utf8"));
 
 const {Pool}=pg;
 const app=express();
@@ -18,7 +21,7 @@ const pool=new Pool({connectionString:process.env.DATABASE_URL});
 const upload=multer({storage:multer.memoryStorage(),limits:{fileSize:20*1024*1024}});
 
 const SESSION_MAX_AGE_MS=90*24*60*60*1000;
-function sessionSecret(){return process.env.SESSION_SECRET||process.env.APP_PASSWORD||"carbon-copy-dev-secret"}
+function sessionSecret(){return process.env.SESSION_SECRET||process.env.APP_PASSWORD||`${V.slug}-dev-secret`}
 function signSession(username){
   const expires=Date.now()+SESSION_MAX_AGE_MS;
   const payload=`${username}.${expires}`;
@@ -44,7 +47,7 @@ function parseCookies(req){
   return out;
 }
 function loginPage({error}={}){
-  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Carbon Copy Accounting — Sign in</title>
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${V.appName} — Sign in</title>
   <style>
     @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=Fraunces:opsz,wght@9..144,600&display=swap');
     *{box-sizing:border-box}
@@ -64,8 +67,8 @@ function loginPage({error}={}){
     .error{background:#fbe6e4;border:1px solid #e2a8a4;color:#b3312c;padding:10px 12px;font-size:13px;margin-bottom:16px}
   </style></head><body>
   <form class="card" method="post" action="/login">
-    <div class="yacht"><img src="/assets/yacht.jpg" alt="M/Y Carbon Copy"></div>
-    <div class="eyebrow">M/Y CARBON COPY</div>
+    <div class="yacht"><img src="/assets/yacht.jpg" alt="${V.vesselName}"></div>
+    <div class="eyebrow">${V.vesselName.toUpperCase()}</div>
     <h1>Accounting</h1>
     ${error?`<div class="error">${error}</div>`:""}
     <label for="u">Username</label>
@@ -111,42 +114,13 @@ app.get("/logout",(req,res)=>{
   res.redirect("/login");
 });
 app.use(express.json({limit:"8mb"}));
+app.get("/api/vessel",(q,r)=>r.json(V));
 app.use(express.static("public"));
 
 
-let ocrWorkerPromise=null;
-async function getOcrWorker(){
-  if(!ocrWorkerPromise){
-    ocrWorkerPromise=(async()=>{
-      const worker=await createWorker("eng");
-      await worker.setParameters({
-        tessedit_pageseg_mode:PSM.AUTO,
-        preserve_interword_spaces:"1",
-        user_defined_dpi:"300",
-        load_system_dawg:"0",
-        load_freq_dawg:"0"
-      });
-      return worker;
-    })().catch((e)=>{ocrWorkerPromise=null;throw e});
-  }
-  return ocrWorkerPromise;
-}
-function isoReceiptDate(raw){
-  if(!raw)return null;
-  let m=String(raw).match(/\b(20\d{2})[-\/.](\d{1,2})[-\/.](\d{1,2})\b/);
-  if(m)return [m[1],String(m[2]).padStart(2,"0"),String(m[3]).padStart(2,"0")].join("-");
-  m=String(raw).match(/\b(\d{1,2})[-\/.](\d{1,2})[-\/.](20\d{2}|\d{2})\b/);
-  if(!m)return null;
-  let y=Number(m[3]);if(y<100)y+=2000;
-  const mo=Number(m[1]),d=Number(m[2]);
-  if(mo<1||mo>12||d<1||d>31)return null;
-  return [y,String(mo).padStart(2,"0"),String(d).padStart(2,"0")].join("-");
-}
-function amountFromLine(line){
-  const vals=[...String(line).matchAll(/(?:\$\s*)?(-?\d{1,6}(?:,\d{3})*\.\d{2})\b/g)]
-    .map((m)=>Number(m[1].replace(/,/g,""))).filter(Number.isFinite);
-  return vals.length?vals[vals.length-1]:null;
-}
+
+
+
 function safeFilePart(value){
   return String(value||"Receipt").replace(/[^a-z0-9 .&_-]+/gi,"").replace(/\s+/g," ").trim().slice(0,80)||"Receipt";
 }
@@ -162,166 +136,21 @@ function receiptFileName(vendor,date,amount,mime,original){
   const amountPart=amount!==null&&amount!==undefined&&Number.isFinite(Number(amount))?" - $"+Number(amount).toFixed(2):"";
   return safeFilePart(vendorPart+" - "+datePart+amountPart)+ext;
 }
-function detectPaymentMethodFromText(text){
-  const t=String(text||"").toLowerCase();
-  if(/\b(payment|tender(?:ed)?|paid)\s*:?\s*cash\b|\bcash\s+(tendered|payment)\b/i.test(t))return "cash";
-  if(/\b(payment|paid)\s*:?\s*check\b|\bcheck\s*#?/i.test(t))return "check";
-  if(/\b(payment|paid)\s*:?\s*wire\b|\bwire\s+(transfer|payment)\b/i.test(t))return "wire";
-  if(/\b(visa|mastercard|amex|american express|discover|credit card|card ending|card #)\b/i.test(t))return "credit_card";
-  return null;
-}
-function suggestedCategoryFromText(text){
-  const t=String(text||"").toLowerCase();
-  if(/\b(diver|diving|bottom clean|underwater|zinc|hubbell|plug|cable|pump|hose|clamp|sealant|hardware|acetone|mineral spirits|handrail|gate|repair|maintenance|part|parts|engine room)\b/i.test(t))return "Repairs & Maintenance";
-  if(/\b(food|grocery|groceries|meal|restaurant|cafe|coffee|snack|beverage|water|provision|provisions|market|publix|whole foods|trader joe)\b/i.test(t))return "Provisions";
-  if(/\b(starlink|internet|wifi|directv|television|phone|cellular|communications)\b/i.test(t))return "Communications / Internet";
-  if(/\b(dock|dockage|marina|slip|berth|yacht club|storage)\b/i.test(t))return "Dockage / Marina";
-  if(/\b(customs|dtops|decal|port fee|entry fee)\b/i.test(t))return "Customs / Port Fees";
-  if(/\b(office|paper|printer|ink|staples|notebook)\b/i.test(t))return "Supplies";
-  if(/\b(weather|routing|forecast|buoyweather|weatherbell)\b/i.test(t))return "Navigation Bridge";
-  if(/\b(uber|lyft|taxi|rideshare)\b/i.test(t))return "Transportation";
-  if(/\b(fuel|diesel|gasoline|gas station|racetrac|wawa|lubricant|oil)\b/i.test(t))return "Fuel & Lubricants";
-  return null;
-}
-function labeledAmount(lines,re){
-  for(let i=lines.length-1;i>=0;i--){
-    if(!re.test(lines[i]))continue;
-    const same=amountFromLine(lines[i]);
-    if(same!==null)return same;
-    for(let step=1;step<=2;step++){
-      const next=lines[i+step];
-      if(!next)break;
-      if(/subtotal|cash tendered|tendered|change|tip|gratuity/i.test(next))break;
-      const a=amountFromLine(next);
-      if(a!==null)return a;
-    }
-  }
-  return null;
-}
-function parseOcrReceipt(text){
-  const lines=String(text||"").split(/\r?\n/).map((x)=>x.replace(/\s+/g," ").trim()).filter(Boolean);
-  const paymentText=lines.join(" ");
-  const detected_payment_method=detectPaymentMethodFromText(paymentText);
 
-  let amount=labeledAmount(lines,/^(?:grand\s+total|total|amount\s+due|balance\s+due)\b/i);
-  if(amount===null)amount=labeledAmount(lines,/\b(grand\s+total|amount\s+due|balance\s+due|total)\b/i);
-  const subtotal=labeledAmount(lines,/^subtotal\b/i);
-  const tax=labeledAmount(lines,/^(?:sales\s+)?tax\b/i);
-  const total_verified=amount!==null&&subtotal!==null&&tax!==null&&Math.abs((subtotal+tax)-amount)<0.08;
 
-  let receipt_date=null;
-  for(const line of lines){receipt_date=isoReceiptDate(line);if(receipt_date)break}
 
-  const reject=/\b(receipt|invoice|thank you|welcome|www\.|http|tel\b|phone\b|date\b|time\b|cashier\b|register\b|transaction\b|order\b|subtotal\b|total\b|tax\b|visa\b|mastercard\b|amex\b|payment\b|cash\b|change\b)\b/i;
-  const vendor=lines.slice(0,10).find((line)=>
-    line.length>=3&&line.length<=70&&!reject.test(line)&&
-    !/^\W*[\d\s#()+.\/-]+\W*$/.test(line)&&
-    !/^\d+\s+\w+\s+(st|street|ave|avenue|rd|road|blvd|drive|dr|hwy|highway)\b/i.test(line)
-  )||null;
 
-  return {
-    vendor,receipt_date,amount,subtotal,tax,total_verified,
-    receipt_text:lines.join("\n"),
-    suggested_category:suggestedCategoryFromText(text),
-    detected_payment_method
-  };
-}
-function mergeOcrFields(full,top,bottom,confidence){
-  const merged={
-    vendor:top.vendor||full.vendor||null,
-    receipt_date:full.receipt_date||top.receipt_date||bottom.receipt_date||null,
-    amount:bottom.amount??full.amount??null,
-    subtotal:bottom.subtotal??full.subtotal??null,
-    tax:bottom.tax??full.tax??null,
-    total_verified:Boolean(bottom.total_verified||full.total_verified),
-    receipt_text:full.receipt_text||"",
-    suggested_category:full.suggested_category||bottom.suggested_category||top.suggested_category||null,
-    detected_payment_method:bottom.detected_payment_method||full.detected_payment_method||null,
-    confidence:Math.round(Number(confidence)||0)
-  };
-  const reasons=[];
-  if(!merged.vendor)reasons.push("vendor");
-  if(!merged.receipt_date)reasons.push("date");
-  if(merged.amount===null)reasons.push("total");
-  if(!merged.detected_payment_method)reasons.push("payment method");
-  if(!merged.suggested_category)reasons.push("category");
-  if(merged.amount!==null&&!merged.total_verified&&merged.subtotal!==null&&merged.tax!==null)reasons.push("total arithmetic");
-  let score=0;
-  if(merged.vendor)score++;
-  if(merged.receipt_date)score++;
-  if(merged.amount!==null)score++;
-  if(merged.detected_payment_method)score++;
-  if(merged.suggested_category)score++;
-  merged.field_score=score;
-  merged.review_reasons=reasons;
-  return merged;
-}
-function chooseBestAmount(parsedList){
-  const candidates=parsedList.filter((p)=>p&&p.amount!==null&&p.amount!==undefined);
-  if(!candidates.length)return null;
-  const verified=candidates.filter((p)=>p.total_verified);
-  if(verified.length){
-    const counts=new Map();
-    verified.forEach((p)=>counts.set(Number(p.amount).toFixed(2),(counts.get(Number(p.amount).toFixed(2))||0)+1));
-    return Number([...counts.entries()].sort((a,b)=>b[1]-a[1])[0][0]);
-  }
-  const counts=new Map();
-  candidates.forEach((p)=>counts.set(Number(p.amount).toFixed(2),(counts.get(Number(p.amount).toFixed(2))||0)+1));
-  const ranked=[...counts.entries()].sort((a,b)=>b[1]-a[1]);
-  if(ranked[0]&&ranked[0][1]>=2)return Number(ranked[0][0]);
-  return Number(candidates[0].amount);
-}
 
-async function ocrImage(buffer){
-  const base=await sharp(buffer,{failOn:"none"})
-    .rotate()
-    .resize({width:2600,height:3600,fit:"inside",withoutEnlargement:true})
-    .grayscale()
-    .normalize()
-    .sharpen()
-    .extend({top:40,bottom:40,left:40,right:40,background:"white"})
-    .png()
-    .toBuffer();
 
-  const meta=await sharp(base).metadata();
-  const width=meta.width,height=meta.height;
-  const topHeight=Math.max(1,Math.round(height*0.34));
-  const bottomTop=Math.max(0,Math.round(height*0.42));
-  const bottomHeight=Math.max(1,height-bottomTop);
 
-  const topCrop=await sharp(base).extract({left:0,top:0,width,height:topHeight}).png().toBuffer();
-  const bottomGray=await sharp(base).extract({left:0,top:bottomTop,width,height:bottomHeight}).png().toBuffer();
-  const bottomT160=await sharp(bottomGray).threshold(160).png().toBuffer();
-  const bottomT200=await sharp(bottomGray).threshold(200).png().toBuffer();
 
-  const worker=await getOcrWorker();
-  await worker.setParameters({tessedit_pageseg_mode:PSM.SINGLE_BLOCK,preserve_interword_spaces:"1"});
-  const fullResult=await worker.recognize(base);
-  const topResult=await worker.recognize(topCrop);
-  const bottomGrayResult=await worker.recognize(bottomGray);
-  const bottom160Result=await worker.recognize(bottomT160);
-  const bottom200Result=await worker.recognize(bottomT200);
-
-  const full=parseOcrReceipt(fullResult?.data?.text||"");
-  const top=parseOcrReceipt(topResult?.data?.text||"");
-  const b1=parseOcrReceipt(bottomGrayResult?.data?.text||"");
-  const b2=parseOcrReceipt(bottom160Result?.data?.text||"");
-  const b3=parseOcrReceipt(bottom200Result?.data?.text||"");
-  const amount=chooseBestAmount([b1,b2,b3,full]);
-
-  const merged=mergeOcrFields(full,top,b1,fullResult?.data?.confidence);
-  merged.amount=amount;
-  merged.total_verified=[b1,b2,b3,full].some((p)=>p.total_verified&&p.amount!==null&&amount!==null&&Math.abs(Number(p.amount)-Number(amount))<0.01);
-  const combinedBottomText=[b1.receipt_text,b2.receipt_text,b3.receipt_text].filter(Boolean).join("\n");
-  merged.detected_payment_method=detectPaymentMethodFromText(combinedBottomText)||merged.detected_payment_method;
-  if(merged.amount===null&&!merged.review_reasons.includes("total"))merged.review_reasons.push("total");
-  if(merged.amount!==null)merged.review_reasons=merged.review_reasons.filter((x)=>x!=="total");
-  merged.field_score=[merged.vendor,merged.receipt_date,merged.amount!==null,merged.detected_payment_method,merged.suggested_category].filter(Boolean).length;
-  return merged;
-}
 async function combineReceiptImages(files){
   if(!files?.length)throw new Error("No receipt images");
-  if(files.length===1)return {buffer:files[0].buffer,content_type:files[0].mimetype,file_name:files[0].originalname};
+  if(files.length===1){
+    const f=files[0];
+    if(isHeic(f.buffer))return {buffer:await toReadable(f.buffer),content_type:"image/jpeg",file_name:String(f.originalname).replace(/\.hei[cf]$/i,"")+".jpg"};
+    return {buffer:f.buffer,content_type:f.mimetype,file_name:f.originalname};
+  }
   if(files.some((f)=>f.mimetype==="application/pdf"))throw Object.assign(new Error("Multi-image receipt bundles must be images, not PDFs"),{statusCode:422});
   const normalized=[];
   let maxWidth=0,totalHeight=0;
@@ -341,24 +170,6 @@ async function combineReceiptImages(files){
   }
   const buffer=await sharp({create:{width:maxWidth,height:totalHeight,channels:3,background:"white"}}).composite(composite).png().toBuffer();
   return {buffer,content_type:"image/png",file_name:`receipt-bundle-${files.length}-images.png`};
-}
-function mergeReceiptPages(pages){
-  const fullText=pages.map((p,i)=>`--- PAGE ${i+1} ---\n${p.receipt_text||""}`).join("\n");
-  const vendor=pages.find((p)=>p.vendor)?.vendor||null;
-  const receipt_date=pages.find((p)=>p.receipt_date)?.receipt_date||null;
-  const amount=[...pages].reverse().find((p)=>p.amount!==null&&p.amount!==undefined)?.amount??null;
-  const detected_payment_method=[...pages].reverse().find((p)=>p.detected_payment_method)?.detected_payment_method||null;
-  const suggested_category=suggestedCategoryFromText(fullText);
-  const subtotal=[...pages].reverse().find((p)=>p.subtotal!==null&&p.subtotal!==undefined)?.subtotal??null;
-  const tax=[...pages].reverse().find((p)=>p.tax!==null&&p.tax!==undefined)?.tax??null;
-  const total_verified=pages.some((p)=>p.total_verified);
-  const confidence=Math.round(pages.reduce((sum,p)=>sum+(Number(p.confidence)||0),0)/Math.max(1,pages.length));
-  return mergeOcrFields(
-    {vendor,receipt_date,amount,subtotal,tax,total_verified,receipt_text:fullText,suggested_category,detected_payment_method},
-    {vendor,receipt_date},
-    {amount,subtotal,tax,total_verified,suggested_category,detected_payment_method},
-    confidence
-  );
 }
 
 function monthBounds(month){
@@ -404,7 +215,7 @@ async function duplicateExemptVendorPatterns(){
 }
 function fingerprint(r){
   return crypto.createHash("sha256").update([
-    r.transaction_date||"",r.posted_date||"",String(r.card_last4||"0945").padStart(4,"0"),
+    r.transaction_date||"",r.posted_date||"",String(r.card_last4||V.cardLast4).padStart(4,"0"),
     String(r.vendor_raw||"").trim().toUpperCase(),Number(r.amount||0).toFixed(2)
   ].join("|")).digest("hex")
 }
@@ -439,6 +250,10 @@ async function init(){
     ALTER TABLE receipts ADD COLUMN IF NOT EXISTS ocr_confidence INT;
     ALTER TABLE receipts ADD COLUMN IF NOT EXISTS ocr_field_score INT;
     ALTER TABLE receipts ADD COLUMN IF NOT EXISTS ocr_review_reasons TEXT;
+    ALTER TABLE receipts ADD COLUMN IF NOT EXISTS ocr_guess JSONB;
+    CREATE TABLE IF NOT EXISTS receipt_pages(
+      id BIGSERIAL PRIMARY KEY,receipt_id BIGINT NOT NULL REFERENCES receipts(id) ON DELETE CASCADE,page_no INT NOT NULL,
+      file_name TEXT NOT NULL,file_sha256 TEXT NOT NULL,file_data BYTEA NOT NULL,raw JSONB,UNIQUE(receipt_id,page_no));
     ALTER TABLE receipts ADD COLUMN IF NOT EXISTS match_method TEXT;
     ALTER TABLE receipts ADD COLUMN IF NOT EXISTS match_score INT;
     ALTER TABLE receipts ADD COLUMN IF NOT EXISTS matched_at TIMESTAMPTZ;
@@ -479,7 +294,7 @@ async function init(){
     ALTER TABLE transactions ADD COLUMN IF NOT EXISTS approval_note TEXT;
     ALTER TABLE transactions ADD COLUMN IF NOT EXISTS approved_by TEXT;
   `);
-  await pool.query("INSERT INTO cards(label,last4) VALUES($1,$2) ON CONFLICT(last4) DO NOTHING",["Capital One","0945"]);
+  await pool.query("INSERT INTO cards(label,last4) VALUES($1,$2) ON CONFLICT(last4) DO NOTHING",[V.cardLabel,V.cardLast4]);
   const cats=["Fuel & Lubricants","Dockage / Marina","Repairs & Maintenance","Provisions","Supplies","Insurance","Communications / Internet","Crew Travel","Crew Meals","Training / Certifications","Safety Equipment","Tender / Toys","Professional Services","Shipping / Freight","Customs / Port Fees","Guest Expenses","Transportation","Capital Improvements","Owner / Personal","Navigation / Weather","Miscellaneous"];
   for(let i=0;i<cats.length;i++)await pool.query("INSERT INTO categories(name,sort_order) VALUES($1,$2) ON CONFLICT(name) DO NOTHING",[cats[i],(i+1)*10]);
   // ponytail: seedInitialData() (imports seed.js's historical CSV/receipts, and
@@ -507,11 +322,11 @@ async function seedInitialData(){
     }
   }
   const lines=capitalOneCsv.replace(/\r/g,"").split("\n").filter(Boolean),headers=parseCsvLine(lines[0]).map(x=>x.toLowerCase().replace(/\./g,"").trim());
-  const ix=n=>headers.findIndex(h=>h===n),card=(await pool.query("SELECT id FROM cards WHERE last4='0945' LIMIT 1")).rows[0];
+  const ix=n=>headers.findIndex(h=>h===n),card=(await pool.query("SELECT id FROM cards WHERE last4=$1 LIMIT 1",[V.cardLast4])).rows[0];
   for(const line of lines.slice(1)){
     const c=parseCsvLine(line),debit=Number(c[ix("debit")]||NaN),credit=Number(c[ix("credit")]||NaN);
     const amount=Number.isFinite(debit)&&debit!==0?Math.abs(debit):Number.isFinite(credit)&&credit!==0?-Math.abs(credit):null;
-    const row={transaction_date:csvDate(c[ix("transaction date")]),posted_date:csvDate(c[ix("posted date")]),vendor_raw:c[ix("description")]||"",amount,card_last4:String(c[ix("card no")]||"945").padStart(4,"0")};
+    const row={transaction_date:csvDate(c[ix("transaction date")]),posted_date:csvDate(c[ix("posted date")]),vendor_raw:c[ix("description")]||"",amount,card_last4:String(c[ix("card no")]||V.cardLast4).padStart(4,"0")};
     if(!row.transaction_date||!row.vendor_raw||row.amount===null)continue;
     const ext=fingerprint(row),rule=(await pool.query("SELECT category_id FROM vendor_rules WHERE $1 ILIKE '%'||vendor_pattern||'%' ORDER BY length(vendor_pattern) DESC LIMIT 1",[row.vendor_raw])).rows[0];
     // ponytail: deliberately not setting approval_status here — this seeds old
@@ -616,9 +431,9 @@ app.post("/api/ocr",upload.any(),async(req,res,next)=>{try{
   }
   const allowed=["image/jpeg","image/png","image/webp","image/heic","image/heif","application/octet-stream"];
   if(files.some((f)=>!allowed.includes(f.mimetype)))return res.status(415).json({error:"OCR supports JPG, PNG, WEBP, HEIC and HEIF images"});
-  const pages=[];
-  for(const f of files)pages.push(await ocrImage(f.buffer));
-  const data=pages.length===1?pages[0]:mergeReceiptPages(pages);
+  const raws=[];
+  for(const f of files)raws.push(await ocrRaw(f.buffer));
+  const data=interpretRaw(raws.length===1?raws[0]:combineRaws(raws));
   res.json({...data,page_count:files.length});
 }catch(e){next(e)}});
 
@@ -662,7 +477,7 @@ app.put("/api/settings/mail",async(req,res,next)=>{try{
   if(mail_from===undefined&&alert_email_to===undefined)return res.status(400).json({error:"Provide mail_from and/or alert_email_to"});
   const updates={};
   if(mail_from!==undefined){
-    if(mail_from!==null&&!isValidEmailValue(mail_from))return res.status(400).json({error:"mail_from must be a valid email, e.g. 'Carbon Copy Accounting <alerts@yourdomain.com>'"});
+    if(mail_from!==null&&!isValidEmailValue(mail_from))return res.status(400).json({error:"mail_from must be a valid email, e.g. 'Vessel Accounting <alerts@yourdomain.com>'"});
     updates.mail_from=mail_from;
   }
   if(alert_email_to!==undefined){
@@ -713,7 +528,7 @@ app.get("/api/transactions",async(req,res,next)=>{try{
 
 app.post("/api/transactions",async(req,res,next)=>{try{
   const rows=Array.isArray(req.body.rows)?req.body.rows:[req.body];
-  const card=(await pool.query("SELECT id FROM cards WHERE last4='0945' LIMIT 1")).rows[0];
+  const card=(await pool.query("SELECT id FROM cards WHERE last4=$1 LIMIT 1",[V.cardLast4])).rows[0];
 
   // Whole-file re-upload safety: if the client sends a hash of the source file,
   // re-uploading the exact same statement is a safe no-op instead of relying on
@@ -740,7 +555,7 @@ app.post("/api/transactions",async(req,res,next)=>{try{
     r.posted_date=r.posted_date?String(r.posted_date).slice(0,10):null;
     r.vendor_raw=String(r.vendor_raw||r.vendor||r.description||"").trim();
     r.amount=moneyNum(r.amount);
-    r.card_last4=String(r.card_last4||r.card_no||"0945").replace(/\D/g,"").slice(-4).padStart(4,"0");
+    r.card_last4=String(r.card_last4||r.card_no||V.cardLast4).replace(/\D/g,"").slice(-4).padStart(4,"0");
     r.payment_method=["credit_card","wire","check","cash"].includes(r.payment_method)?r.payment_method:"credit_card";
     if(!/^\d{4}-\d{2}-\d{2}$/.test(r.transaction_date)||!r.vendor_raw||r.amount===null){skipped++;continue}
     if((await pool.query("SELECT closed FROM month_closes WHERE month_start=$1",[r.transaction_date.slice(0,7)+"-01"])).rows[0]?.closed){blockedClosedMonth++;continue}
@@ -912,12 +727,26 @@ async function repairOrphanNonCardReceipts(){
 app.get("/api/receipt-inbox",async(_req,res,next)=>{try{
   await repairOrphanNonCardReceipts();
   const q=await pool.query(`SELECT r.id,r.receipt_date,r.vendor,r.amount,r.file_name,r.created_at,r.expires_at,r.purged_at,r.receipt_text,r.payment_method,r.payment_reference,
-      r.review_required,r.ocr_confidence,r.ocr_field_score,r.ocr_review_reasons,c.name category_name,c.id category_id,
+      r.review_required,r.ocr_confidence,r.ocr_field_score,r.ocr_review_reasons,c.name category_name,c.id category_id,(SELECT COUNT(*)::int FROM receipt_pages p WHERE p.receipt_id=r.id) page_count,
       CASE WHEN r.payment_method = 'credit_card' THEN 'waiting' ELSE 'review' END bucket
     FROM receipts r LEFT JOIN categories c ON c.id=r.category_id WHERE r.transaction_id IS NULL ORDER BY COALESCE(r.receipt_date,r.created_at::date) DESC,r.id DESC`);
   res.json({rows:q.rows})
 }catch(e){next(e)}});
 
+app.get("/api/ocr/corrections",async(_req,res,next)=>{try{
+  const q=await pool.query(`SELECT r.id,r.file_name,r.receipt_date,r.vendor,r.amount,r.payment_method,c.name category,r.ocr_guess
+    FROM receipts r LEFT JOIN categories c ON c.id=r.category_id WHERE r.ocr_guess IS NOT NULL ORDER BY r.id DESC LIMIT 500`);
+  const norm=(x)=>String(x||"").toUpperCase().replace(/[^A-Z0-9]/g,"");
+  const rows=q.rows.map((r)=>{const g=r.ocr_guess,d=r.receipt_date?new Date(r.receipt_date).toISOString().slice(0,10):null;
+    const changed=[];
+    if(norm(g.vendor)!==norm(r.vendor))changed.push("vendor");
+    if((g.date||null)!==d)changed.push("date");
+    if(Number(g.amount)!==Number(r.amount))changed.push("total");
+    if((g.payment||null)!==(r.payment_method||null))changed.push("payment");
+    return {id:r.id,file_name:r.file_name,guess:g,final:{vendor:r.vendor,date:d,total:r.amount===null?null:Number(r.amount),payment:r.payment_method,category:r.category},changed};});
+  const n=rows.length,fields=["vendor","date","total","payment"];
+  res.json({receipts:n,corrected:Object.fromEntries(fields.map((f)=>[f,rows.filter((r)=>r.changed.includes(f)).length])),rows});
+}catch(e){next(e)}});
 app.post("/api/receipts",upload.any(),async(req,res,next)=>{try{
   const files=req.files||[];if(!files.length)return res.status(400).json({error:"Receipt file required"});
   const allowed=["image/jpeg","image/png","image/webp","image/heic","image/heif","application/pdf","application/octet-stream"];
@@ -975,8 +804,10 @@ app.post("/api/receipts",upload.any(),async(req,res,next)=>{try{
       ON CONFLICT DO NOTHING RETURNING id`,[date,vendor,amount,chosenCategory,ext,paymentMethod,paymentReference,Number.isFinite(cat),await approvalStatusFor(amount)]);
     tid=tr.rows[0]?.id||((await pool.query("SELECT id FROM transactions WHERE external_id=$1 LIMIT 1",[ext])).rows[0]?.id||null);
   }
-  const q=await pool.query(`INSERT INTO receipts(transaction_id,file_name,content_type,file_size,file_data,receipt_date,vendor,amount,category_id,file_sha256,receipt_text,expires_at,payment_method,payment_reference,review_required)
-    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW()+INTERVAL '60 days',$12,$13,false) RETURNING id,file_name,expires_at`,[Number.isFinite(tid)?tid:null,f.originalname,f.mimetype,f.size,f.buffer,date,vendor,amount,inferredCat,sha,receiptText,paymentMethod,paymentReference]);
+  // what the reader guessed, kept beside what the captain saved, so corrections can be measured
+  let ocrGuess=null;try{ocrGuess=req.body.ocr_guess?JSON.stringify(JSON.parse(req.body.ocr_guess)):null}catch{}
+  const q=await pool.query(`INSERT INTO receipts(transaction_id,file_name,content_type,file_size,file_data,receipt_date,vendor,amount,category_id,file_sha256,receipt_text,expires_at,payment_method,payment_reference,review_required,ocr_guess)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW()+INTERVAL '60 days',$12,$13,false,$14) RETURNING id,file_name,expires_at`,[Number.isFinite(tid)?tid:null,f.originalname,f.mimetype,f.size,f.buffer,date,vendor,amount,inferredCat,sha,receiptText,paymentMethod,paymentReference,ocrGuess]);
   const matched=paymentMethod==="credit_card"?await autoMatchReceipt(q.rows[0].id):null;
   res.status(201).json({...q.rows[0],matched_transaction_id:matched,created_transaction_id:Number.isFinite(tid)?tid:null,payment_method:paymentMethod})
 }catch(e){next(e)}});
@@ -1209,7 +1040,7 @@ app.get("/api/export/register",async(req,res,next)=>{try{
       col.width=col.header==="Notes"?Math.min(max+2,60):max+2;
     });
     res.set("Content-Type","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-    res.set("Content-Disposition",`attachment; filename="carbon-copy-register-${month}.xlsx"`);
+    res.set("Content-Disposition",`attachment; filename="${V.slug}-register-${month}.xlsx"`);
     await wb.xlsx.write(res);
     return res.end();
   }
@@ -1223,7 +1054,7 @@ app.get("/api/export/register",async(req,res,next)=>{try{
     ].map(csvCell).join(","));
   }
   res.set("Content-Type","text/csv");
-  res.set("Content-Disposition",`attachment; filename="carbon-copy-register-${month}.csv"`);
+  res.set("Content-Disposition",`attachment; filename="${V.slug}-register-${month}.csv"`);
   res.send(lines.join("\n"));
 }catch(e){next(e)}});
 
@@ -1383,7 +1214,7 @@ async function backupDatabase(){
     return{uploaded:false,bytes:gz.length};
   }
   const client=new AwsClient({accessKeyId,secretAccessKey,region:"auto",service:"s3"});
-  const key=`carbon-copy-${new Date().toISOString().slice(0,10)}-${Date.now()}.json.gz`;
+  const key=`${V.slug}-${new Date().toISOString().slice(0,10)}-${Date.now()}.json.gz`;
   const url=`https://${bucket}.${new URL(endpoint).host}/${key}`;
   const res=await client.fetch(url,{method:"PUT",body:gz,headers:{"Content-Type":"application/gzip"}});
   if(!res.ok)throw new Error(`Backup upload failed: ${res.status} ${await res.text()}`);
@@ -1417,6 +1248,119 @@ async function ingestReceiptFromEmail(buffer,mimetype,filename){
   const matched=paymentMethod==="credit_card"?await autoMatchReceipt(q.rows[0].id):null;
   return{skipped:false,id:q.rows[0].id,matched_transaction_id:matched,payment_method:paymentMethod};
 }
+
+
+// ---- Folder inbox: one receipt = one or more photos, kept as separate pages ----
+const IMG_TYPES={".jpg":"image/jpeg",".jpeg":"image/jpeg",".png":"image/png",".webp":"image/webp",".heic":"image/heic",".heif":"image/heif",".pdf":"application/pdf"};
+const sha256=(b)=>crypto.createHash("sha256").update(b).digest("hex");
+function typeOfName(name,fallback){return IMG_TYPES[String(name).toLowerCase().match(/\.[^.]+$/)?.[0]]||fallback}
+function interpretPages(raws,totalIdx){return interpretRaw(raws.length===1?raws[0]:combineRaws(raws,totalIdx))}
+
+// pages: [{buffer,name,sha,raw}] (raw = ocrRaw result or null). Saves one receipt + its pages.
+async function saveReceiptPages(pages,{autoGrouped=false}={}){
+  const groupSha=pages.length===1?pages[0].sha:sha256(pages.map((p)=>p.sha).join(""));
+  const dup=(await pool.query("SELECT id FROM receipts WHERE file_sha256=$1",[groupSha])).rows[0];
+  if(dup)return{status:"duplicate",id:dup.id};
+  const raws=pages.map((p)=>p.raw).filter(Boolean);
+  let d={vendor:null,receipt_date:null,amount:null,suggested_category:null,detected_payment_method:null,receipt_text:null,confidence:null,field_score:null,review_reasons:[]};
+  if(raws.length===pages.length)d=interpretPages(raws);
+  const reasons=[...(d.review_reasons||[])];
+  if(pages.length>1)reasons.push(autoGrouped?"photos grouped automatically":"multi-photo receipt");
+  const combined=await combineReceiptImages(pages.map((p)=>({buffer:p.buffer,mimetype:typeOfName(p.name,"image/jpeg"),originalname:p.name})));
+  const mime=combined.content_type,full=combined.buffer;
+  const pay=(d.detected_payment_method&&d.detected_payment_method!=="credit_card")?d.detected_payment_method:"credit_card";
+  const finalName=receiptFileName(d.vendor,d.receipt_date,d.amount,mime,combined.file_name||pages[0].name);
+  const guess=JSON.stringify({vendor:d.vendor,date:d.receipt_date,amount:d.amount,payment:d.detected_payment_method,category:d.suggested_category,flags:reasons});
+  const client=await pool.connect();let id;
+  try{
+    await client.query("BEGIN");
+    const q=await client.query(`INSERT INTO receipts(transaction_id,file_name,content_type,file_size,file_data,receipt_date,vendor,amount,category_id,file_sha256,receipt_text,expires_at,payment_method,review_required,ocr_confidence,ocr_field_score,ocr_review_reasons,ocr_guess)
+      VALUES(NULL,$1,$2,$3,$4,$5,$6,$7,NULL,$8,$9,NOW()+INTERVAL '60 days',$10,true,$11,$12,$13,$14) RETURNING id`,
+      [finalName,mime,full.length,full,d.receipt_date,d.vendor,d.amount,groupSha,d.receipt_text,pay,d.confidence==null?null:Math.round(d.confidence),d.field_score,reasons.join(","),guess]);
+    id=q.rows[0].id;
+    for(const [i,p] of pages.entries())await client.query("INSERT INTO receipt_pages(receipt_id,page_no,file_name,file_sha256,file_data,raw) VALUES($1,$2,$3,$4,$5,$6)",[id,i+1,p.name,p.sha,p.buffer,p.raw?JSON.stringify(p.raw):null]);
+    await client.query("COMMIT");
+  }catch(e){await client.query("ROLLBACK");throw e}finally{client.release()}
+  const matched=pay==="credit_card"?await autoMatchReceipt(id):null;
+  return{status:"ingested",id,pages:pages.length,matched_transaction_id:matched};
+}
+
+async function readPages(files){
+  const out=[];
+  for(const f of files){
+    const heic=isHeic(f.buffer);
+    const buffer=heic?await toReadable(f.buffer):f.buffer,sha=sha256(f.buffer);
+    const name=heic?String(f.originalname).replace(/\.hei[cf]$/i,"")+".jpg":f.originalname;
+    let raw=null;
+    try{raw=await ocrRaw(buffer)}catch(e){console.error("INBOX_OCR_FAILED",name,e.message)}
+    out.push({buffer,name,sha,raw});
+  }
+  return out;
+}
+
+// mode=folder: every file is one receipt (a subfolder). mode=auto: loose files, guess the groups.
+app.post("/api/receipts/inbox",upload.any(),async(req,res,next)=>{try{
+  const files=req.files||[];if(!files.length)return res.status(400).json({error:"Files required"});
+  if(files.length>60)return res.status(413).json({error:"Send at most 60 files at once"});
+  const bad=files.filter((f)=>!typeOfName(f.originalname,null));
+  if(bad.length)return res.status(415).json({error:`Unsupported file type: ${bad.map((f)=>f.originalname).join(", ")}`});
+  let mtimes=[];try{mtimes=JSON.parse(req.body.mtimes||"[]")}catch{}
+  let groups;
+  if(req.body.mode==="folder"){
+    const order=files.map((_,i)=>i).sort((a,b)=>files[a].originalname.localeCompare(files[b].originalname,undefined,{numeric:true}));
+    groups=files.some((f)=>/\.pdf$/i.test(f.originalname))?order.map((i)=>[i]):[order];
+  }else groups=groupLoosePhotos(files.map((f,i)=>({name:f.originalname,mtime:Number(mtimes[i])||0})));
+  const results=[];
+  for(const g of groups){
+    const gf=g.map((i)=>files[i]),names=gf.map((f)=>f.originalname);
+    try{
+      if(gf.length===1&&/\.pdf$/i.test(names[0])){
+        const r=await ingestReceiptFromEmail(gf[0].buffer,"application/pdf",names[0]);
+        results.push({files:names,status:r.skipped?(r.reason==="duplicate"?"duplicate":"error"):"ingested",id:r.id,error:r.skipped&&r.reason!=="duplicate"?r.reason:undefined});
+      }else{
+        const r=await saveReceiptPages(await readPages(gf),{autoGrouped:req.body.mode!=="folder"&&gf.length>1});
+        results.push({files:names,...r});
+      }
+    }catch(e){console.error("INBOX_GROUP_FAILED",names,e.message);results.push({files:names,status:"error",error:e.message})}
+  }
+  res.json({groups:results});
+}catch(e){next(e)}});
+
+app.get("/api/receipts/:id/pages",async(req,res,next)=>{try{
+  const q=await pool.query("SELECT page_no,file_name FROM receipt_pages WHERE receipt_id=$1 ORDER BY page_no",[Number(req.params.id)]);
+  res.json({pages:q.rows});
+}catch(e){next(e)}});
+app.get("/api/receipts/:id/pages/:n",async(req,res,next)=>{try{
+  const r=(await pool.query("SELECT file_name,file_data FROM receipt_pages WHERE receipt_id=$1 AND page_no=$2",[Number(req.params.id),Number(req.params.n)])).rows[0];
+  if(!r)return res.sendStatus(404);
+  res.type(typeOfName(r.file_name,"image/jpeg"));res.send(r.file_data);
+}catch(e){next(e)}});
+
+// "The total is on this photo": re-read the receipt using that photo's bottom as the total source. Returns fields; saves nothing.
+app.post("/api/receipts/:id/total-page",async(req,res,next)=>{try{
+  const id=Number(req.params.id),page=Number(req.body.page);
+  const rows=(await pool.query("SELECT page_no,raw FROM receipt_pages WHERE receipt_id=$1 ORDER BY page_no",[id])).rows;
+  if(!rows.length)return res.status(404).json({error:"No stored photos for this receipt"});
+  const idx=rows.findIndex((r)=>r.page_no===page);if(idx<0)return res.status(400).json({error:"No such photo"});
+  if(rows.some((r)=>!r.raw))return res.status(422).json({error:"These photos could not be read automatically"});
+  res.json({...interpretPages(rows.map((r)=>r.raw),idx),page});
+}catch(e){next(e)}});
+
+// Split a bundled receipt after photo n into two receipts (re-interpreted from stored reads, no re-OCR).
+app.post("/api/receipts/:id/split",async(req,res,next)=>{try{
+  const id=Number(req.params.id),after=Number(req.body.after);
+  const r=(await pool.query("SELECT transaction_id FROM receipts WHERE id=$1",[id])).rows[0];
+  if(!r)return res.sendStatus(404);
+  if(r.transaction_id)return res.status(409).json({error:"This receipt is already matched to a transaction"});
+  const pg=(await pool.query("SELECT page_no,file_name,file_sha256 sha,file_data buffer,raw FROM receipt_pages WHERE receipt_id=$1 ORDER BY page_no",[id])).rows;
+  const a=pg.filter((p)=>p.page_no<=after),b=pg.filter((p)=>p.page_no>after);
+  if(!a.length||!b.length)return res.status(400).json({error:"Split must leave at least one photo on each side"});
+  const toPages=(arr)=>arr.map((p)=>({buffer:p.buffer,name:p.file_name,sha:p.sha,raw:p.raw}));
+  await pool.query("DELETE FROM receipts WHERE id=$1",[id]);
+  const out=[];for(const part of [a,b])out.push(await saveReceiptPages(toPages(part),{autoGrouped:true}));
+  await audit("captain","split","receipt",id,{pages:pg.length},{new_ids:out.map((x)=>x.id)},{source:"POST /api/receipts/:id/split"});
+  res.json({receipts:out});
+}catch(e){next(e)}});
 
 async function pullReceiptEmails(){
   const user=process.env.GMAIL_USER,pass=process.env.GMAIL_APP_PASSWORD;
@@ -1490,7 +1434,7 @@ async function sendAlertDigest(){
     lines.push("");
   }
   if(monthReady)lines.push(`${month} has no open items and is ready to close.`);
-  await sendMail({to:alertTo,subject:"Carbon Copy Accounting — needs a decision",text:lines.join("\n")});
+  await sendMail({to:alertTo,subject:`${V.appName} — needs a decision`,text:lines.join("\n")});
   console.log(`ALERTS_COMPLETE sent: ${approvals.length} approvals, ${duplicates.length} duplicates, month_ready=${monthReady}`);
   return{sent:true,approvals:approvals.length,duplicates:duplicates.length,monthReady};
 }
@@ -1531,7 +1475,7 @@ async function runMonitorCheck(){
   if(alertTo){
     await sendMail({
       to:alertTo,
-      subject:`Carbon Copy Accounting — monthly check: ${allOk?"all clear":"needs attention"}`,
+      subject:`${V.appName} — monthly check: ${allOk?"all clear":"needs attention"}`,
       text:lines.join("\n"),
     });
   }
@@ -1559,6 +1503,6 @@ if(maintenanceFlag){
   process.exit(0);
 }
 
-app.listen(port,"0.0.0.0",()=>console.log(`Carbon Copy Accounting listening on ${port}`));
+app.listen(port,"0.0.0.0",()=>console.log(`${V.appName} listening on ${port}`));
 
 export {app,pool,init};

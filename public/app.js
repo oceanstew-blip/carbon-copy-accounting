@@ -156,6 +156,7 @@ async function loadReceiptInbox(){
       '<div class="muted">'+esc(String(r.receipt_date||'No date').slice(0,10))+' · '+(r.amount==null?'No amount':money(r.amount))+
       ' · '+esc(paymentNames[r.payment_method]||'Payment not confirmed')+'</div>'+
       quality+
+      (r.page_count>1?'<div class="muted">'+r.page_count+' photos in this receipt</div>':'')+
       '<div><span class="badge">'+esc(r.category_name||'Uncategorized')+'</span></div>'+
       '<button class="receipt-thumb" data-id="'+r.id+'" type="button"><img src="/api/receipts/'+r.id+'" alt="Receipt '+r.id+' preview"></button>'+
       '<div class="row"><button class="show-receipt" data-id="'+r.id+'" type="button">View Here</button></div>'+
@@ -195,6 +196,7 @@ async function loadReceiptInbox(){
     $('#reviewPrompt').textContent='Editing receipt #'+r.id+'. Your corrections will replace the extracted values.';
     $('#uploadReceipt').textContent='Save Corrections';
     renderExistingReceiptPreview(r.id);
+    if(r.page_count>1)renderPageStrip(r.id);
     const preview=$('#receiptPreview');
     if(preview)preview.scrollIntoView({behavior:'smooth',block:'center'});
 
@@ -306,6 +308,35 @@ function renderLocalReceiptPreview(files){
   const urls=imgs.map((f)=>URL.createObjectURL(f));
   box.innerHTML='<div class="preview-strip">'+urls.map((u,i)=>'<img src="'+u+'" alt="Receipt page '+(i+1)+'">').join('')+'</div>';
 }
+// Long receipts shot as several photos: tap the photo that has the total, or split a mistaken bundle.
+async function renderPageStrip(id){
+  const box=$('#receiptPreview'); if(!box)return;
+  const d=await api('receipts/'+id+'/pages').catch(()=>null);
+  const pages=d&&d.pages||[]; if(pages.length<2)return;
+  const strip=document.createElement('div'); strip.className='preview-strip';
+  strip.innerHTML='<p class="muted">'+pages.length+' photos. Tap the one that shows the total, or split if these are different receipts.</p>'+
+    pages.map((p,i)=>'<div class="page-card"><img src="/api/receipts/'+id+'/pages/'+p.page_no+'" alt="Photo '+p.page_no+'">'+
+      '<div class="row"><button type="button" class="total-here" data-page="'+p.page_no+'">Total is on photo '+p.page_no+'</button></div>'+
+      (i<pages.length-1?'<div class="row"><button type="button" class="split-here" data-page="'+p.page_no+'">Split after photo '+p.page_no+'</button></div>':'')+'</div>').join('');
+  box.appendChild(strip);
+  strip.querySelectorAll('.total-here').forEach((b)=>b.addEventListener('click',async()=>{
+    try{
+      const f=await api('receipts/'+id+'/total-page',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({page:Number(b.dataset.page)})});
+      if(f.amount!=null)$('#rAmount').value=Number(f.amount).toFixed(2);
+      $('#ocrStatus').className=f.amount==null?'warn':'ok';
+      $('#ocrStatus').textContent=f.amount==null?'No total could be read on photo '+b.dataset.page+'. Type it in from the photo.':'Total read from photo '+b.dataset.page+': '+money(f.amount)+'. Check it against the photo, then save.';
+    }catch(e){toast(e.message||'Could not re-read')}
+  }));
+  strip.querySelectorAll('.split-here').forEach((b)=>b.addEventListener('click',async()=>{
+    if(!confirm('Split into two receipts after photo '+b.dataset.page+'?'))return;
+    try{
+      await api('receipts/'+id+'/split',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({after:Number(b.dataset.page)})});
+      toast('Split into two receipts');
+      resetReceiptReview();
+      await loadReceiptInbox();
+    }catch(e){toast(e.message||'Could not split')}
+  }));
+}
 function renderExistingReceiptPreview(id){
   const box=$('#receiptPreview'); if(!box)return;
   box.innerHTML='<img src="/api/receipts/'+encodeURIComponent(id)+'" alt="Receipt preview">';
@@ -325,8 +356,10 @@ async function runReceiptOcr(files){
     return;
   }
   const fd=new FormData();list.forEach((f)=>fd.append('files',f));
+  window.__ocrGuess=null;
   try{
     const r=await api('ocr',{method:'POST',body:fd});
+    window.__ocrGuess={vendor:r.vendor,date:r.receipt_date,amount:r.amount,payment:r.detected_payment_method,category:r.suggested_category,flags:r.review_reasons};
     $('#rDate').value=r.receipt_date||'';
     $('#rVendor').value=r.vendor||'';
     $('#rAmount').value=r.amount==null?'':Number(r.amount).toFixed(2);
@@ -554,6 +587,7 @@ function wireStaticControls(){
     fd.append('receipt_date',$('#rDate').value);fd.append('vendor',$('#rVendor').value.trim());fd.append('amount',$('#rAmount').value);
     fd.append('payment_method',payment);fd.append('payment_reference',$('#rReference').value);fd.append('receipt_text',$('#rText').value);
     if($('#rCategory').value) fd.append('category_id',$('#rCategory').value);
+    if(window.__ocrGuess) fd.append('ocr_guess',JSON.stringify(window.__ocrGuess));
     const r=await api('receipts',{method:'POST',body:fd});
     const actualPayment=r.payment_method||payment;
     const nonCard=['cash','wire','check'].includes(actualPayment);
