@@ -9,9 +9,59 @@ total (the final amount charged, number), subtotal (number), tax (number),
 payment_method (one of credit_card, cash, check, wire), card_last4 (4 digits if shown, else null),
 total_page (1-based page where the final total is printed).`;
 
-export const visionEnabled=()=>Boolean(process.env.ANTHROPIC_API_KEY);
+const azureOn=()=>Boolean(process.env.AZURE_DI_ENDPOINT&&process.env.AZURE_DI_KEY);
+export const visionEnabled=()=>azureOn()||Boolean(process.env.ANTHROPIC_API_KEY);
+export const visionEngine=()=>azureOn()?"azure-document-intelligence":process.env.ANTHROPIC_API_KEY?"claude-vision":null;
+const sleep=(ms)=>new Promise((r)=>setTimeout(r,ms));
+const money=(f)=>f?.valueCurrency?.amount??f?.valueNumber??null;
 
-export async function visionRead(buffers,{fetchImpl=fetch}={}){
+// Azure AI Document Intelligence, prebuilt receipt model. One document per call: a PDF goes up as-is,
+// several photos are stacked into one tall image first.
+async function azureRead(buffers,{fetchImpl=fetch,original=null}={}){
+  let bytes=original;
+  if(!bytes){
+    const imgs=await Promise.all(buffers.map((b)=>sharp(b,{failOn:"none"}).rotate().resize({width:1800,withoutEnlargement:true}).png().toBuffer()));
+    if(imgs.length===1)bytes=imgs[0];
+    else{
+      const meta=await Promise.all(imgs.map((b)=>sharp(b).metadata()));
+      const w=Math.max(...meta.map((m)=>m.width)),h=meta.reduce((n,m)=>n+m.height,0);
+      let top=0;
+      bytes=await sharp({create:{width:w,height:h,channels:3,background:"white"}}).composite(imgs.map((input,i)=>{const o={input,left:0,top};top+=meta[i].height;return o})).jpeg({quality:90}).toBuffer();
+    }
+  }
+  const base=process.env.AZURE_DI_ENDPOINT.replace(/\/$/,"");
+  const headers={"Ocp-Apim-Subscription-Key":process.env.AZURE_DI_KEY};
+  const start=await fetchImpl(`${base}/documentintelligence/documentModels/prebuilt-receipt:analyze?api-version=2024-11-30`,{
+    method:"POST",headers:{...headers,"content-type":"application/json"},
+    body:JSON.stringify({base64Source:bytes.toString("base64")}),signal:AbortSignal.timeout(30000)
+  });
+  if(start.status!==202)throw new Error(`azure analyze ${start.status}`);
+  const poll=start.headers.get("operation-location");if(!poll)throw new Error("azure gave no operation location");
+  for(let i=0;i<40;i++){
+    await sleep(i?1000:500);
+    const r=await fetchImpl(poll,{headers,signal:AbortSignal.timeout(30000)});
+    if(!r.ok)throw new Error(`azure poll ${r.status}`);
+    const j=await r.json();
+    if(j.status==="failed")throw new Error("azure analysis failed");
+    if(j.status!=="succeeded")continue;
+    const docs=j.analyzeResult?.documents||[];
+    if(!docs.length)return{vendor:null,receipt_date:null,amount:null,subtotal:null,tax:null,detected_payment_method:null,card_last4:null,total_page:null,multiple:false,conf:{}};
+    const d=docs[0].fields||{};
+    const num=(x)=>x==null?null:Math.round(Number(x)*100)/100;
+    return{
+      vendor:d.MerchantName?.valueString?.trim()||null,
+      receipt_date:/^\d{4}-\d{2}-\d{2}$/.test(d.TransactionDate?.valueDate||"")?d.TransactionDate.valueDate:null,
+      amount:num(money(d.Total)),subtotal:num(money(d.Subtotal)),tax:num(money(d.TotalTax)),
+      detected_payment_method:null,card_last4:null,total_page:null,multiple:docs.length>1,
+      conf:{total:d.Total?.confidence??null,vendor:d.MerchantName?.confidence??null,date:d.TransactionDate?.confidence??null}
+    };
+  }
+  throw new Error("azure analysis timed out");
+}
+
+export async function visionRead(buffers,opts={}){
+  if(azureOn())return azureRead(buffers,opts);
+  const {fetchImpl=fetch}=opts;
   const content=[];
   for(const b of buffers){
     const jpeg=await sharp(b,{failOn:"none"}).rotate().resize({width:1600,height:2400,fit:"inside",withoutEnlargement:true}).jpeg({quality:88}).toBuffer();
@@ -55,7 +105,9 @@ export function applyVision(tess,v){
     out.amount=v.amount;strip("total");strip("total unverified");strip("total arithmetic");
     out.total_verified=arithmetic;out.total_corroborated=agrees||arithmetic;
     if(!agrees&&!arithmetic)out.review_reasons.push(tess.amount==null?"total unverified":"total disagrees with second read");
+    if(!agrees&&!arithmetic&&v.conf?.total!=null&&v.conf.total<0.8)out.review_reasons.push("total low confidence");
   }
+  if(v.multiple)out.review_reasons.push("more than one receipt detected in this file");
   out.field_score=[out.vendor,out.receipt_date,out.amount!=null,out.detected_payment_method,out.suggested_category].filter(Boolean).length;
   return out;
 }

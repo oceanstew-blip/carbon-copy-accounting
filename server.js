@@ -3,7 +3,7 @@ import multer from "multer";
 import pg from "pg";
 import crypto from "crypto";
 import sharp from "sharp";
-import { withVision } from "./vision.js";
+import { withVision, visionRead, visionEnabled, visionEngine } from "./vision.js";
 import { promises as fsp } from "fs";
 import { ocrRaw, interpretRaw, combineRaws, groupLoosePhotos, pdfToImages, toReadable, isHeic, getOcrWorker, isoReceiptDate, amountFromLine, detectPaymentMethodFromText, suggestedCategoryFromText, labeledAmount, parseOcrReceipt, mergeOcrFields, chooseBestAmount, ocrImage } from "./ocr.js";
 import { AwsClient } from "aws4fetch";
@@ -405,7 +405,7 @@ async function matchAllReceipts(){
 app.get("/health",(_req,res)=>res.json({ok:true}));
 
 
-app.get("/api/ocr/status",(_req,res)=>res.json({enabled:true,mode:"server-side",engine:"tesseract",formats:["JPG","PNG","WEBP","HEIC","HEIF"],manual_fallback:true}));
+app.get("/api/ocr/status",(_req,res)=>res.json({enabled:true,mode:"server-side",engine:"tesseract",formats:["JPG","PNG","WEBP","HEIC","HEIF"],manual_fallback:true,second_reader:visionEngine()}));
 
 app.get("/api/ocr/self-test",async(_req,res,next)=>{try{
   // ponytail: this used to render its own SVG-with-text at request time, which
@@ -430,7 +430,7 @@ app.post("/api/ocr",upload.any(),async(req,res,next)=>{try{
     if(files.length>1)return res.status(422).json({error:"Upload a PDF receipt on its own, or several photos together."});
     const {images}=pdfToImages(files[0].buffer);const raws=[];
     for(const img of images)raws.push(await ocrRaw(img));
-    return res.json({...await withVision(interpretRaw(raws.length===1?raws[0]:combineRaws(raws)),images),page_count:images.length});
+    return res.json({...await withVision(interpretRaw(raws.length===1?raws[0]:combineRaws(raws)),images,{original:files[0].buffer}),page_count:images.length});
   }
   const allowed=["image/jpeg","image/png","image/webp","image/heic","image/heif","application/octet-stream"];
   if(files.some((f)=>!allowed.includes(f.mimetype)))return res.status(415).json({error:"OCR supports JPG, PNG, WEBP, HEIC and HEIF images"});
@@ -824,11 +824,43 @@ app.post("/api/receipts/:id/ocr",async(req,res,next)=>{try{
   if(r.content_type==="application/pdf"){
     const {images}=pdfToImages(r.file_data);const raws=[];
     for(const img of images)raws.push(await ocrRaw(img));
-    return res.json(await withVision(interpretRaw(raws.length===1?raws[0]:combineRaws(raws)),images));
+    return res.json(await withVision(interpretRaw(raws.length===1?raws[0]:combineRaws(raws)),images,{original:r.file_data}));
   }
   if(!String(r.content_type||"").startsWith("image/")&&!/heic|heif|octet-stream/i.test(String(r.content_type||"")))return res.status(415).json({error:"This receipt type cannot be re-read automatically"});
   const out=await withVision(await ocrImage(r.file_data),[r.file_data]);
   res.json(out);
+}catch(e){next(e)}});
+
+// Read-only accuracy check on receipts the captain already filed: does each reader agree with what is saved?
+// Spends one vision/Azure call per receipt (max 50). Saved values may themselves have been accepted without a close look.
+app.get("/api/ocr/compare",async(req,res,next)=>{try{
+  if(!visionEnabled())return res.status(412).json({error:"No second reader configured (set AZURE_DI_ENDPOINT + AZURE_DI_KEY, or ANTHROPIC_API_KEY)"});
+  const limit=Math.min(50,Math.max(1,Number(req.query.limit)||20));
+  const rows=(await pool.query(`SELECT id,content_type,file_data,receipt_date,vendor,amount FROM receipts
+    WHERE transaction_id IS NOT NULL AND file_data IS NOT NULL AND purged_at IS NULL AND amount IS NOT NULL ORDER BY id DESC LIMIT $1`,[limit])).rows;
+  const norm=(x)=>String(x||"").toLowerCase().replace(/[^a-z0-9]/g,"");
+  const same={total:(a,b)=>a!=null&&b!=null&&Math.abs(Number(a)-Number(b))<0.01,
+    date:(a,b)=>!!a&&!!b&&String(a).slice(0,10)===String(b).slice(0,10),
+    vendor:(a,b)=>{const x=norm(a),y=norm(b);return x.length>2&&y.length>2&&(x.includes(y)||y.includes(x))}};
+  const score={tesseract:{total:0,date:0,vendor:0},second:{total:0,date:0,vendor:0}},out=[];
+  for(const r of rows){
+    const saved={vendor:r.vendor,date:r.receipt_date&&new Date(r.receipt_date).toISOString().slice(0,10),total:Number(r.amount)};
+    let t=null,v=null,err=null;
+    try{
+      let imgs=[r.file_data],original=null;
+      if(r.content_type==="application/pdf"){imgs=pdfToImages(r.file_data).images;original=r.file_data}
+      const raws=[];for(const i of imgs)raws.push(await ocrRaw(i));
+      t=interpretRaw(raws.length===1?raws[0]:combineRaws(raws));
+      v=await visionRead(imgs,{original});
+    }catch(e){err=e.message}
+    const row={id:r.id,saved,tesseract:t&&{vendor:t.vendor,date:t.receipt_date,total:t.amount},second:v&&{vendor:v.vendor,date:v.receipt_date,total:v.amount},error:err};
+    for(const k of ["total","date","vendor"]){
+      if(t&&same[k](saved[k],row.tesseract[k]))score.tesseract[k]++;
+      if(v&&same[k](saved[k],row.second[k]))score.second[k]++;
+    }
+    out.push(row);
+  }
+  res.json({engine:visionEngine(),receipts:rows.length,correct:score,rows:out});
 }catch(e){next(e)}});
 
 app.patch("/api/receipts/:id",async(req,res,next)=>{try{
@@ -1274,7 +1306,7 @@ async function saveReceiptPages(pages,{autoGrouped=false,original=null,extraReas
   if(dup)return{status:"duplicate",id:dup.id};
   const raws=pages.map((p)=>p.raw).filter(Boolean);
   let d={vendor:null,receipt_date:null,amount:null,suggested_category:null,detected_payment_method:null,receipt_text:null,confidence:null,field_score:null,review_reasons:[]};
-  if(raws.length===pages.length)d=await withVision(interpretPages(raws),pages.map((p)=>p.buffer));
+  if(raws.length===pages.length)d=await withVision(interpretPages(raws),pages.map((p)=>p.buffer),{original:original?.buffer});
   const reasons=[...(d.review_reasons||[])];
   if(pages.length>1)reasons.push(original?"multi-page PDF":autoGrouped?"photos grouped automatically":"multi-photo receipt");
   reasons.push(...extraReasons);

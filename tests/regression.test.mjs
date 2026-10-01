@@ -831,6 +831,36 @@ test("vision second read: fills fields, flags disagreement with Tesseract, and f
   } finally { delete process.env.ANTHROPIC_API_KEY; delete process.env.ANTHROPIC_BASE_URL; srv.close(); }
 });
 
+test("azure document intelligence: PDF goes up as-is, fields come back, compare endpoint is gated", async () => {
+  const http = await import("node:http");
+  const { readFileSync } = await import("node:fs");
+  const pdf = readFileSync(new URL("./fixtures/ocr-self-test-receipt.pdf", import.meta.url));
+  let r = await apiFetch("/api/ocr/compare");
+  assert.equal(r.status, 412);
+  let sent = null, port;
+  const srv = http.createServer((req, res) => {
+    let body = ""; req.on("data", (c) => (body += c)); req.on("end", () => {
+      res.setHeader("content-type", "application/json");
+      if (req.method === "POST") { sent = JSON.parse(body); res.statusCode = 202; res.setHeader("operation-location", `http://127.0.0.1:${port}/poll/1`); return res.end("{}"); }
+      res.end(JSON.stringify({ status: "succeeded", analyzeResult: { documents: [{ fields: {
+        MerchantName: { valueString: "Azure Marine", confidence: 0.97 }, TransactionDate: { valueDate: "2026-09-26", confidence: 0.99 },
+        Total: { valueCurrency: { amount: 87.46 }, confidence: 0.98 }, Subtotal: { valueCurrency: { amount: 80 } }, TotalTax: { valueCurrency: { amount: 7.46 } } } }] } }));
+    });
+  });
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r)); port = srv.address().port;
+  process.env.AZURE_DI_ENDPOINT = `http://127.0.0.1:${port}`; process.env.AZURE_DI_KEY = "k";
+  try {
+    const f = new FormData(); f.append("files", new Blob([pdf], { type: "application/pdf" }), "s.pdf");
+    r = await fetch(BASE + "/api/ocr", { method: "POST", headers: { Authorization: AUTH }, body: f });
+    const d = await r.json();
+    assert.equal(d.vendor, "Azure Marine"); assert.equal(d.amount, 87.46); assert.equal(d.total_corroborated, true);
+    assert.equal(Buffer.from(sent.base64Source, "base64").toString("latin1", 0, 4), "%PDF");
+    r = await apiFetch("/api/ocr/compare?limit=5");
+    assert.equal(r.status, 200);
+    assert.equal((await r.json()).engine, "azure-document-intelligence");
+  } finally { delete process.env.AZURE_DI_ENDPOINT; delete process.env.AZURE_DI_KEY; srv.close(); }
+});
+
 async function run() {
   await setup();
   let pass = 0, fail = 0;
