@@ -156,7 +156,7 @@ async function loadReceiptInbox(){
       '<div class="muted">'+esc(String(r.receipt_date||'No date').slice(0,10))+' · '+(r.amount==null?'No amount':money(r.amount))+
       ' · '+esc(paymentNames[r.payment_method]||'Payment not confirmed')+'</div>'+
       quality+
-      (r.page_count>1?'<div class="muted">'+r.page_count+' photos in this receipt</div>':'')+
+      (r.page_count>1?'<div class="muted">'+r.page_count+' pages in this receipt</div>':'')+
       '<div><span class="badge">'+esc(r.category_name||'Uncategorized')+'</span></div>'+
       '<button class="receipt-thumb" data-id="'+r.id+'" type="button"><img src="/api/receipts/'+r.id+'" alt="Receipt '+r.id+' preview"></button>'+
       '<div class="row"><button class="show-receipt" data-id="'+r.id+'" type="button">View Here</button></div>'+
@@ -314,21 +314,21 @@ async function renderPageStrip(id){
   const d=await api('receipts/'+id+'/pages').catch(()=>null);
   const pages=d&&d.pages||[]; if(pages.length<2)return;
   const strip=document.createElement('div'); strip.className='preview-strip';
-  strip.innerHTML='<p class="muted">'+pages.length+' photos. Tap the one that shows the total, or split if these are different receipts.</p>'+
-    pages.map((p,i)=>'<div class="page-card"><img src="/api/receipts/'+id+'/pages/'+p.page_no+'" alt="Photo '+p.page_no+'">'+
-      '<div class="row"><button type="button" class="total-here" data-page="'+p.page_no+'">Total is on photo '+p.page_no+'</button></div>'+
-      (i<pages.length-1?'<div class="row"><button type="button" class="split-here" data-page="'+p.page_no+'">Split after photo '+p.page_no+'</button></div>':'')+'</div>').join('');
+  strip.innerHTML='<p class="muted">'+pages.length+' pages. Tap the one that shows the total, or split if these are different receipts.</p>'+
+    pages.map((p,i)=>'<div class="page-card"><img src="/api/receipts/'+id+'/pages/'+p.page_no+'" alt="Page '+p.page_no+'">'+
+      '<div class="row"><button type="button" class="total-here" data-page="'+p.page_no+'">Total is on page '+p.page_no+'</button></div>'+
+      (i<pages.length-1?'<div class="row"><button type="button" class="split-here" data-page="'+p.page_no+'">Split after page '+p.page_no+'</button></div>':'')+'</div>').join('');
   box.appendChild(strip);
   strip.querySelectorAll('.total-here').forEach((b)=>b.addEventListener('click',async()=>{
     try{
       const f=await api('receipts/'+id+'/total-page',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({page:Number(b.dataset.page)})});
       if(f.amount!=null)$('#rAmount').value=Number(f.amount).toFixed(2);
       $('#ocrStatus').className=f.amount==null?'warn':'ok';
-      $('#ocrStatus').textContent=f.amount==null?'No total could be read on photo '+b.dataset.page+'. Type it in from the photo.':'Total read from photo '+b.dataset.page+': '+money(f.amount)+'. Check it against the photo, then save.';
+      $('#ocrStatus').textContent=f.amount==null?'No total could be read on page '+b.dataset.page+'. Type it in from the photo.':'Total read from page '+b.dataset.page+': '+money(f.amount)+'. Check it against the photo, then save.';
     }catch(e){toast(e.message||'Could not re-read')}
   }));
   strip.querySelectorAll('.split-here').forEach((b)=>b.addEventListener('click',async()=>{
-    if(!confirm('Split into two receipts after photo '+b.dataset.page+'?'))return;
+    if(!confirm('Split into two receipts after page '+b.dataset.page+'?'))return;
     try{
       await api('receipts/'+id+'/split',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({after:Number(b.dataset.page)})});
       toast('Split into two receipts');
