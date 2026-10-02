@@ -885,7 +885,9 @@ test("test-receipt cleanup: preview first, removes a manual receipt + its transa
   await pool.query(`INSERT INTO transactions(transaction_date,posted_date,vendor_raw,vendor_normalized,amount,source,external_id,status,payment_method)
     SELECT transaction_date,posted_date,vendor_raw,vendor_normalized,amount,'manual','twin-'||id,'posted',payment_method FROM transactions WHERE id=$1`, [tx]);
   r = await apiFetch(`/admin/test-receipts?ids=${rid}`);
-  assert.match(await r.text(), /AND its manual transaction/);
+  const page = await r.text();
+  assert.match(page, /AND its manual transaction/);
+  assert.match(page, /2024-06-14/, "full date with year");
   assert.equal((await pool.query("SELECT 1 FROM receipts WHERE id=$1", [rid])).rowCount, 1);
   r = await apiFetch("/api/receipts/clear-tests", { method: "POST", body: JSON.stringify({ ids: [rid] }) });
   assert.equal(r.status, 200);

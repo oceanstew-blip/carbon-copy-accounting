@@ -882,6 +882,7 @@ app.get("/admin/twin-transactions",async(_req,res,next)=>{try{
 // Nothing is deleted from a GET. Closed months are never touched. A receipt created from a manual (cash/check/wire)
 // entry takes its transaction with it; a receipt matched to an imported card charge is removed alone.
 const escHtml=(x)=>String(x??"").replace(/[&<>"]/g,(c)=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const isoDay=(d)=>d instanceof Date?d.toISOString().slice(0,10):String(d||"").slice(0,10);
 function parseIds(q){return[...new Set(String(q||"").split(",").map(Number).filter((n)=>Number.isInteger(n)&&n>0))].slice(0,10)}
 async function planTestRemoval(ids){
   const out=[];
@@ -911,12 +912,12 @@ app.get("/admin/test-receipts",async(req,res,next)=>{try{
   const ids=parseIds(req.query.ids);
   const plan=await planTestRemoval(ids);
   const label={remove_both:"Remove the receipt AND its manual transaction (plus any unlinked duplicate copy)",remove_receipt:"Remove the receipt only (any linked card charge stays)",blocked:"Not touched: that month is closed",missing:"Not found"};
-  const rows=plan.map((p)=>`<tr><td>#${p.id}</td><td>${escHtml(p.vendor)}</td><td>${escHtml(String(p.receipt_date||"").slice(0,10))}</td><td>${p.amount==null?"":"$"+Number(p.amount).toFixed(2)}</td><td>${escHtml(p.payment_method)}</td><td>${p.transaction_id?"txn "+p.transaction_id+" ("+escHtml(p.source)+")":"none"}${p.twins?.length?"<br>duplicate copy: txn "+p.twins.join(", "):""}</td><td><b>${label[p.action]}</b></td></tr>`).join("");
+  const rows=plan.map((p)=>`<tr><td>#${p.id}</td><td>${escHtml(p.vendor)}</td><td>${escHtml(isoDay(p.receipt_date))}</td><td>${escHtml(isoDay(p.transaction_date))}</td><td>${p.amount==null?"":"$"+Number(p.amount).toFixed(2)}</td><td>${escHtml(p.payment_method)}</td><td>${p.transaction_id?"txn "+p.transaction_id+" ("+escHtml(p.source)+")":"none"}${p.twins?.length?"<br>duplicate copy: txn "+p.twins.join(", "):""}</td><td><b>${label[p.action]}</b></td></tr>`).join("");
   const n=plan.filter((p)=>p.action==="remove_both"||p.action==="remove_receipt").length;
   res.type("html").send(`<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>Remove test receipts</title>
 <body style="font:16px system-ui;max-width:900px;margin:30px auto;padding:0 16px"><h1>Remove test receipts</h1>
 <p>Nothing is removed until you press the button. Every removal is written to the audit log with the full record.</p>
-<table border="1" cellpadding="8" style="border-collapse:collapse;width:100%"><tr><th>Receipt</th><th>Vendor</th><th>Date</th><th>Amount</th><th>Payment</th><th>Linked</th><th>What will happen</th></tr>${rows||'<tr><td colspan="7">Add ?ids=16,17,18 to the address.</td></tr>'}</table>
+<table border="1" cellpadding="8" style="border-collapse:collapse;width:100%"><tr><th>Receipt</th><th>Vendor</th><th>Receipt date</th><th>Transaction date</th><th>Amount</th><th>Payment</th><th>Linked</th><th>What will happen</th></tr>${rows||'<tr><td colspan="8">Add ?ids=16,17,18 to the address.</td></tr>'}</table>
 <p><button id="go" ${n?"":"disabled"} style="font-size:16px;padding:10px 18px">Remove ${n} test entr${n===1?"y":"ies"}</button> <span id="msg"></span></p>
 <script>document.getElementById("go").onclick=async()=>{const b=document.getElementById("go");b.disabled=true;
 const r=await fetch("/api/receipts/clear-tests",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({ids:${JSON.stringify(ids)}})});
