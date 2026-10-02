@@ -837,10 +837,11 @@ test("azure document intelligence: PDF goes up as-is, fields come back, compare 
   const pdf = readFileSync(new URL("./fixtures/ocr-self-test-receipt.pdf", import.meta.url));
   let r = await apiFetch("/api/ocr/compare");
   assert.equal(r.status, 412);
-  let sent = null, port;
+  let sent = null, port, throttled = false;
   const srv = http.createServer((req, res) => {
     let body = ""; req.on("data", (c) => (body += c)); req.on("end", () => {
       res.setHeader("content-type", "application/json");
+      if (req.method === "POST" && !throttled) { throttled = true; res.statusCode = 429; res.setHeader("retry-after", "0"); return res.end("{}"); }
       if (req.method === "POST") { sent = JSON.parse(body); res.statusCode = 202; res.setHeader("operation-location", `http://127.0.0.1:${port}/poll/1`); return res.end("{}"); }
       res.end(JSON.stringify({ status: "succeeded", analyzeResult: { documents: [{ fields: {
         MerchantName: { valueString: "Azure Marine", confidence: 0.97 }, TransactionDate: { valueDate: "2026-09-26", confidence: 0.99 },

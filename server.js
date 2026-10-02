@@ -852,6 +852,7 @@ app.get("/api/ocr/compare",async(req,res,next)=>{try{
       const raws=[];for(const i of imgs)raws.push(await ocrRaw(i));
       t=interpretRaw(raws.length===1?raws[0]:combineRaws(raws));
       v=await visionRead(imgs,{original});
+      await new Promise((r)=>setTimeout(r,visionEngine()==="azure-document-intelligence"?3500:0)); // stay under the free-tier rate limit
     }catch(e){err=e.message}
     const row={id:r.id,saved,tesseract:t&&{vendor:t.vendor,date:t.receipt_date,total:t.amount},second:v&&{vendor:v.vendor,date:v.receipt_date,total:v.amount},error:err};
     for(const k of ["total","date","vendor"]){

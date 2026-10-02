@@ -31,7 +31,16 @@ async function azureRead(buffers,{fetchImpl=fetch,original=null}={}){
   }
   const base=process.env.AZURE_DI_ENDPOINT.replace(/\/$/,"");
   const headers={"Ocp-Apim-Subscription-Key":process.env.AZURE_DI_KEY};
-  const start=await fetchImpl(`${base}/documentintelligence/documentModels/prebuilt-receipt:analyze?api-version=2024-11-30`,{
+  // Azure's free tier throttles bursts (429): wait as long as it asks and try again.
+  const call=async(url,init)=>{
+    for(let n=0;;n++){
+      const r=await fetchImpl(url,init);
+      if((r.status!==429&&r.status!==503)||n>=5)return r;
+      const ra=Number(r.headers.get("retry-after"));
+      await sleep(Math.min(15000,Number.isFinite(ra)&&ra>=0?ra*1000:2000*(n+1)));
+    }
+  };
+  const start=await call(`${base}/documentintelligence/documentModels/prebuilt-receipt:analyze?api-version=2024-11-30`,{
     method:"POST",headers:{...headers,"content-type":"application/json"},
     body:JSON.stringify({base64Source:bytes.toString("base64")}),signal:AbortSignal.timeout(30000)
   });
@@ -39,7 +48,7 @@ async function azureRead(buffers,{fetchImpl=fetch,original=null}={}){
   const poll=start.headers.get("operation-location");if(!poll)throw new Error("azure gave no operation location");
   for(let i=0;i<40;i++){
     await sleep(i?1000:500);
-    const r=await fetchImpl(poll,{headers,signal:AbortSignal.timeout(30000)});
+    const r=await call(poll,{headers,signal:AbortSignal.timeout(30000)});
     if(!r.ok)throw new Error(`azure poll ${r.status}`);
     const j=await r.json();
     if(j.status==="failed")throw new Error("azure analysis failed");
