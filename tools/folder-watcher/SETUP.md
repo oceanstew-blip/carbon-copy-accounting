@@ -25,3 +25,17 @@ Nothing is posted to the books until you review it.
 ## In the app
 Needs Review lists what came in. Open Review / Fix on a multi-page receipt to see each page.
 Tap "Total is on page N" if the amount is wrong, or "Split after page N" if two receipts got joined.
+
+## What the flags in Needs Review mean
+- **total disagrees with second read**: the two readers saw different totals. Check the amount against the receipt.
+- **total low confidence / total unverified**: the amount might be right but nothing confirmed it. Check it.
+- **date looks wrong**: the date is more than about 100 days old or in the future. Check it.
+- **more than one receipt detected in this file**: the PDF may hold two receipts. Open it, and use Split if needed.
+- **multi-page PDF / photos grouped automatically**: several pages were treated as one receipt. Open Review / Fix to see each page.
+  Tap "Total is on page N" if the amount came from the wrong page, or "Split after page N" if two receipts were joined.
+Nothing is posted to the books until you review it.
+
+## If something does not show up
+1. Wait two minutes, then open `watcher.log` (next to the script) and read the last few lines.
+2. "Cannot reach" means the computer has no internet or the app address is wrong. Run setup again with -Setup.
+3. A file still sitting in the folder after a few minutes was not uploaded. Anything the app could not read stays there on purpose.
