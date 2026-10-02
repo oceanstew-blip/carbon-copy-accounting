@@ -805,7 +805,10 @@ app.post("/api/receipts",upload.any(),async(req,res,next)=>{try{
     const tr=await pool.query(`INSERT INTO transactions(transaction_date,posted_date,vendor_raw,vendor_normalized,amount,category_id,card_id,notes,source,external_id,status,payment_method,payment_reference,captain_reviewed,approval_status)
       VALUES($1,$1,$2,$2,$3,$4,NULL,NULL,'manual',$5,'posted',$6,$7,$8,$9)
       ON CONFLICT DO NOTHING RETURNING id`,[date,vendor,amount,chosenCategory,ext,paymentMethod,paymentReference,Number.isFinite(cat),await approvalStatusFor(amount)]);
-    tid=tr.rows[0]?.id||((await pool.query("SELECT id FROM transactions WHERE external_id=$1 LIMIT 1",[ext])).rows[0]?.id||null);
+    // pg returns BIGINT ids as strings; without Number() the isFinite checks below failed, the receipt was saved
+    // unlinked, and the orphan-repair later created a SECOND transaction for the same expense.
+    const newTid=tr.rows[0]?.id||((await pool.query("SELECT id FROM transactions WHERE external_id=$1 LIMIT 1",[ext])).rows[0]?.id||null);
+    tid=newTid==null?null:Number(newTid);
   }
   // what the reader guessed, kept beside what the captain saved, so corrections can be measured
   let ocrGuess=null;try{ocrGuess=req.body.ocr_guess?JSON.stringify(JSON.parse(req.body.ocr_guess)):null}catch{}
@@ -862,6 +865,73 @@ app.get("/api/ocr/compare",async(req,res,next)=>{try{
     out.push(row);
   }
   res.json({engine:visionEngine(),receipts:rows.length,correct:score,rows:out});
+}catch(e){next(e)}});
+
+// Read-only: cash/check/wire expenses that exist twice because of the unlinked-receipt bug (an unlinked 'manual' copy
+// plus the 'receipt-auto-repair' copy attached to the receipt). Lists them; removes nothing.
+app.get("/admin/twin-transactions",async(_req,res,next)=>{try{
+  const q=await pool.query(`SELECT m.id orphan_id,a.id linked_id,m.transaction_date,m.vendor_raw,m.amount,m.payment_method,
+      COALESCE((SELECT closed FROM month_closes c WHERE c.month_start=date_trunc('month',m.transaction_date)::date),false) month_closed
+    FROM transactions m JOIN transactions a ON a.source='receipt-auto-repair' AND m.source='manual'
+      AND m.transaction_date=a.transaction_date AND lower(m.vendor_raw)=lower(a.vendor_raw) AND m.amount=a.amount AND m.payment_method=a.payment_method
+    WHERE NOT EXISTS(SELECT 1 FROM receipts r WHERE r.transaction_id=m.id) ORDER BY m.transaction_date`);
+  res.json({count:q.rows.length,overcounted_total:q.rows.reduce((n,r)=>n+Number(r.amount),0),rows:q.rows});
+}catch(e){next(e)}});
+
+// ---- Remove test/sample receipts (preview first, then confirm) ----
+// Nothing is deleted from a GET. Closed months are never touched. A receipt created from a manual (cash/check/wire)
+// entry takes its transaction with it; a receipt matched to an imported card charge is removed alone.
+const escHtml=(x)=>String(x??"").replace(/[&<>"]/g,(c)=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+function parseIds(q){return[...new Set(String(q||"").split(",").map(Number).filter((n)=>Number.isInteger(n)&&n>0))].slice(0,10)}
+async function planTestRemoval(ids){
+  const out=[];
+  for(const id of ids){
+    const r=(await pool.query(`SELECT r.id,r.vendor,r.receipt_date,r.amount,r.payment_method,r.transaction_id,t.source,t.transaction_date,t.amount tx_amount
+      FROM receipts r LEFT JOIN transactions t ON t.id=r.transaction_id WHERE r.id=$1`,[id])).rows[0];
+    if(!r){out.push({id,action:"missing"});continue}
+    let closed=false;
+    const when=r.transaction_date||r.receipt_date;
+    if(r.transaction_id&&when){const iso=when instanceof Date?when.toISOString():String(when);
+      closed=Boolean((await pool.query("SELECT closed FROM month_closes WHERE month_start=$1",[iso.slice(0,7)+"-01"])).rows[0]?.closed)}
+    const action=closed?"blocked":!r.transaction_id?"remove_receipt":(r.source==="manual"||r.source==="receipt-auto-repair")?"remove_both":"remove_receipt";
+    out.push({...r,action,closed});
+  }
+  return out;
+}
+app.get("/admin/test-receipts",async(req,res,next)=>{try{
+  const ids=parseIds(req.query.ids);
+  const plan=await planTestRemoval(ids);
+  const label={remove_both:"Remove the receipt AND its manual transaction",remove_receipt:"Remove the receipt only (any linked card charge stays)",blocked:"Not touched: that month is closed",missing:"Not found"};
+  const rows=plan.map((p)=>`<tr><td>#${p.id}</td><td>${escHtml(p.vendor)}</td><td>${escHtml(String(p.receipt_date||"").slice(0,10))}</td><td>${p.amount==null?"":"$"+Number(p.amount).toFixed(2)}</td><td>${escHtml(p.payment_method)}</td><td>${p.transaction_id?"txn "+p.transaction_id+" ("+escHtml(p.source)+")":"none"}</td><td><b>${label[p.action]}</b></td></tr>`).join("");
+  const n=plan.filter((p)=>p.action==="remove_both"||p.action==="remove_receipt").length;
+  res.type("html").send(`<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>Remove test receipts</title>
+<body style="font:16px system-ui;max-width:900px;margin:30px auto;padding:0 16px"><h1>Remove test receipts</h1>
+<p>Nothing is removed until you press the button. Every removal is written to the audit log with the full record.</p>
+<table border="1" cellpadding="8" style="border-collapse:collapse;width:100%"><tr><th>Receipt</th><th>Vendor</th><th>Date</th><th>Amount</th><th>Payment</th><th>Linked</th><th>What will happen</th></tr>${rows||'<tr><td colspan="7">Add ?ids=16,17,18 to the address.</td></tr>'}</table>
+<p><button id="go" ${n?"":"disabled"} style="font-size:16px;padding:10px 18px">Remove ${n} test entr${n===1?"y":"ies"}</button> <span id="msg"></span></p>
+<script>document.getElementById("go").onclick=async()=>{const b=document.getElementById("go");b.disabled=true;
+const r=await fetch("/api/receipts/clear-tests",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({ids:${JSON.stringify(ids)}})});
+document.getElementById("msg").textContent=r.ok?"Done: "+JSON.stringify((await r.json()).removed):"Failed: "+(await r.text())}</script></body>`);
+}catch(e){next(e)}});
+app.post("/api/receipts/clear-tests",async(req,res,next)=>{try{
+  const ids=parseIds((req.body.ids||[]).join(","));
+  if(!ids.length)return res.status(400).json({error:"No receipt ids"});
+  const plan=await planTestRemoval(ids),removed=[];
+  for(const p of plan){
+    if(p.action!=="remove_both"&&p.action!=="remove_receipt")continue;
+    const client=await pool.connect();
+    try{
+      await client.query("BEGIN");
+      const rec=(await client.query("SELECT id,file_name,vendor,receipt_date,amount,payment_method,transaction_id FROM receipts WHERE id=$1",[p.id])).rows[0];
+      let tx=null;
+      if(p.action==="remove_both")tx=(await client.query("DELETE FROM transactions WHERE id=$1 AND source IN('manual','receipt-auto-repair') RETURNING *",[p.transaction_id])).rows[0]||null;
+      await client.query("DELETE FROM receipts WHERE id=$1",[p.id]);
+      await client.query("COMMIT");
+      await audit("captain","removed_test_data","receipt",String(p.id),{receipt:rec,transaction:tx},null,{reason:"Marked as a test/sample receipt",source:"POST /api/receipts/clear-tests"});
+      removed.push({receipt:p.id,transaction:tx?tx.id:null});
+    }catch(e){await client.query("ROLLBACK");throw e}finally{client.release()}
+  }
+  res.json({removed,skipped:plan.filter((p)=>p.action==="blocked"||p.action==="missing").map((p)=>p.id)});
 }catch(e){next(e)}});
 
 app.patch("/api/receipts/:id",async(req,res,next)=>{try{

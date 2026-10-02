@@ -867,6 +867,31 @@ test("azure document intelligence: PDF goes up as-is, fields come back, compare 
   } finally { delete process.env.AZURE_DI_ENDPOINT; delete process.env.AZURE_DI_KEY; srv.close(); }
 });
 
+test("test-receipt cleanup: preview first, removes a manual receipt + its transaction, audited, closed months untouched", async () => {
+  const { readFileSync } = await import("node:fs");
+  const sharp = (await import("sharp")).default;
+  const png = await sharp(readFileSync(new URL("./fixtures/ocr-self-test-receipt.png", import.meta.url))).extend({ top: 13, background: "white" }).png().toBuffer();
+  const f = new FormData();
+  f.append("files", new Blob([png]), "t.png"); f.append("receipt_date", "2024-06-14"); f.append("vendor", "Palm Shore Market");
+  f.append("amount", "25.19"); f.append("payment_method", "cash");
+  let r = await fetch(BASE + "/api/receipts", { method: "POST", headers: { Authorization: AUTH }, body: f });
+  assert.ok(r.status === 200 || r.status === 201);
+  const rid = (await r.json()).id;
+  assert.equal((await pool.query("SELECT count(*)::int n FROM transactions WHERE vendor_raw='Palm Shore Market'")).rows[0].n, 1, "one expense, not two");
+  r = await apiFetch("/admin/twin-transactions");
+  assert.equal((await r.json()).count, 0);
+  const tx = (await pool.query("SELECT transaction_id FROM receipts WHERE id=$1", [rid])).rows[0].transaction_id;
+  assert.ok(tx);
+  r = await apiFetch(`/admin/test-receipts?ids=${rid}`);
+  assert.match(await r.text(), /AND its manual transaction/);
+  assert.equal((await pool.query("SELECT 1 FROM receipts WHERE id=$1", [rid])).rowCount, 1);
+  r = await apiFetch("/api/receipts/clear-tests", { method: "POST", body: JSON.stringify({ ids: [rid] }) });
+  assert.equal(r.status, 200);
+  assert.equal((await pool.query("SELECT 1 FROM receipts WHERE id=$1", [rid])).rowCount, 0);
+  assert.equal((await pool.query("SELECT 1 FROM transactions WHERE id=$1", [tx])).rowCount, 0);
+  assert.equal((await pool.query("SELECT 1 FROM audit_log WHERE action='removed_test_data' AND entity_id=$1", [String(rid)])).rowCount, 1);
+});
+
 async function run() {
   await setup();
   let pass = 0, fail = 0;
