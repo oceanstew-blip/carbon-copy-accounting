@@ -886,7 +886,7 @@ function parseIds(q){return[...new Set(String(q||"").split(",").map(Number).filt
 async function planTestRemoval(ids){
   const out=[];
   for(const id of ids){
-    const r=(await pool.query(`SELECT r.id,r.vendor,r.receipt_date,r.amount,r.payment_method,r.transaction_id,t.source,t.transaction_date,t.amount tx_amount
+    const r=(await pool.query(`SELECT r.id,r.vendor,r.receipt_date,r.amount,r.payment_method,r.transaction_id,t.source,t.transaction_date,t.amount tx_amount,t.vendor_raw tx_vendor,t.payment_method tx_payment
       FROM receipts r LEFT JOIN transactions t ON t.id=r.transaction_id WHERE r.id=$1`,[id])).rows[0];
     if(!r){out.push({id,action:"missing"});continue}
     let closed=false;
@@ -894,15 +894,24 @@ async function planTestRemoval(ids){
     if(r.transaction_id&&when){const iso=when instanceof Date?when.toISOString():String(when);
       closed=Boolean((await pool.query("SELECT closed FROM month_closes WHERE month_start=$1",[iso.slice(0,7)+"-01"])).rows[0]?.closed)}
     const action=closed?"blocked":!r.transaction_id?"remove_receipt":(r.source==="manual"||r.source==="receipt-auto-repair")?"remove_both":"remove_receipt";
-    out.push({...r,action,closed});
+    let twins=[];
+    if(action==="remove_both"){
+      // the unlinked duplicate copy created by the old bug: same day, vendor, amount and payment type, no receipt, month still open
+      twins=(await pool.query(`SELECT o.id FROM transactions o WHERE o.source='manual' AND o.id<>$1 AND o.transaction_date=$2
+        AND lower(o.vendor_raw)=lower($3) AND o.amount=$4 AND o.payment_method=$5
+        AND NOT EXISTS(SELECT 1 FROM receipts x WHERE x.transaction_id=o.id)
+        AND NOT COALESCE((SELECT closed FROM month_closes c WHERE c.month_start=date_trunc('month',o.transaction_date)::date),false)`,
+        [r.transaction_id,r.transaction_date,r.tx_vendor,r.tx_amount,r.tx_payment])).rows.map((x)=>x.id);
+    }
+    out.push({...r,action,closed,twins});
   }
   return out;
 }
 app.get("/admin/test-receipts",async(req,res,next)=>{try{
   const ids=parseIds(req.query.ids);
   const plan=await planTestRemoval(ids);
-  const label={remove_both:"Remove the receipt AND its manual transaction",remove_receipt:"Remove the receipt only (any linked card charge stays)",blocked:"Not touched: that month is closed",missing:"Not found"};
-  const rows=plan.map((p)=>`<tr><td>#${p.id}</td><td>${escHtml(p.vendor)}</td><td>${escHtml(String(p.receipt_date||"").slice(0,10))}</td><td>${p.amount==null?"":"$"+Number(p.amount).toFixed(2)}</td><td>${escHtml(p.payment_method)}</td><td>${p.transaction_id?"txn "+p.transaction_id+" ("+escHtml(p.source)+")":"none"}</td><td><b>${label[p.action]}</b></td></tr>`).join("");
+  const label={remove_both:"Remove the receipt AND its manual transaction (plus any unlinked duplicate copy)",remove_receipt:"Remove the receipt only (any linked card charge stays)",blocked:"Not touched: that month is closed",missing:"Not found"};
+  const rows=plan.map((p)=>`<tr><td>#${p.id}</td><td>${escHtml(p.vendor)}</td><td>${escHtml(String(p.receipt_date||"").slice(0,10))}</td><td>${p.amount==null?"":"$"+Number(p.amount).toFixed(2)}</td><td>${escHtml(p.payment_method)}</td><td>${p.transaction_id?"txn "+p.transaction_id+" ("+escHtml(p.source)+")":"none"}${p.twins?.length?"<br>duplicate copy: txn "+p.twins.join(", "):""}</td><td><b>${label[p.action]}</b></td></tr>`).join("");
   const n=plan.filter((p)=>p.action==="remove_both"||p.action==="remove_receipt").length;
   res.type("html").send(`<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>Remove test receipts</title>
 <body style="font:16px system-ui;max-width:900px;margin:30px auto;padding:0 16px"><h1>Remove test receipts</h1>
@@ -925,10 +934,12 @@ app.post("/api/receipts/clear-tests",async(req,res,next)=>{try{
       const rec=(await client.query("SELECT id,file_name,vendor,receipt_date,amount,payment_method,transaction_id FROM receipts WHERE id=$1",[p.id])).rows[0];
       let tx=null;
       if(p.action==="remove_both")tx=(await client.query("DELETE FROM transactions WHERE id=$1 AND source IN('manual','receipt-auto-repair') RETURNING *",[p.transaction_id])).rows[0]||null;
+      const twinRows=[];
+      for(const tw of p.twins||[])twinRows.push(...(await client.query("DELETE FROM transactions WHERE id=$1 AND source='manual' RETURNING *",[tw])).rows);
       await client.query("DELETE FROM receipts WHERE id=$1",[p.id]);
       await client.query("COMMIT");
-      await audit("captain","removed_test_data","receipt",String(p.id),{receipt:rec,transaction:tx},null,{reason:"Marked as a test/sample receipt",source:"POST /api/receipts/clear-tests"});
-      removed.push({receipt:p.id,transaction:tx?tx.id:null});
+      await audit("captain","removed_test_data","receipt",String(p.id),{receipt:rec,transaction:tx,duplicate_copies:twinRows},null,{reason:"Marked as a test/sample receipt",source:"POST /api/receipts/clear-tests"});
+      removed.push({receipt:p.id,transaction:tx?tx.id:null,duplicate_copies:twinRows.map((x)=>x.id)});
     }catch(e){await client.query("ROLLBACK");throw e}finally{client.release()}
   }
   res.json({removed,skipped:plan.filter((p)=>p.action==="blocked"||p.action==="missing").map((p)=>p.id)});

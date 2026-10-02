@@ -882,6 +882,8 @@ test("test-receipt cleanup: preview first, removes a manual receipt + its transa
   assert.equal((await r.json()).count, 0);
   const tx = (await pool.query("SELECT transaction_id FROM receipts WHERE id=$1", [rid])).rows[0].transaction_id;
   assert.ok(tx);
+  await pool.query(`INSERT INTO transactions(transaction_date,posted_date,vendor_raw,vendor_normalized,amount,source,external_id,status,payment_method)
+    SELECT transaction_date,posted_date,vendor_raw,vendor_normalized,amount,'manual','twin-'||id,'posted',payment_method FROM transactions WHERE id=$1`, [tx]);
   r = await apiFetch(`/admin/test-receipts?ids=${rid}`);
   assert.match(await r.text(), /AND its manual transaction/);
   assert.equal((await pool.query("SELECT 1 FROM receipts WHERE id=$1", [rid])).rowCount, 1);
@@ -889,6 +891,7 @@ test("test-receipt cleanup: preview first, removes a manual receipt + its transa
   assert.equal(r.status, 200);
   assert.equal((await pool.query("SELECT 1 FROM receipts WHERE id=$1", [rid])).rowCount, 0);
   assert.equal((await pool.query("SELECT 1 FROM transactions WHERE id=$1", [tx])).rowCount, 0);
+  assert.equal((await pool.query("SELECT 1 FROM transactions WHERE vendor_raw='Palm Shore Market'")).rowCount, 0, "duplicate copy removed too");
   assert.equal((await pool.query("SELECT 1 FROM audit_log WHERE action='removed_test_data' AND entity_id=$1", [String(rid)])).rowCount, 1);
 });
 
