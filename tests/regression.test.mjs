@@ -809,6 +809,11 @@ test("vision second read: fills fields, flags disagreement with Tesseract, and f
   assert.ok(!o.review_reasons.includes("date") && !o.review_reasons.includes("total unverified"));
   o = applyVision(tess, { vendor: "WAWA", receipt_date: "2026-09-01", amount: 55.58, subtotal: null, tax: null, detected_payment_method: null });
   assert.equal(o.amount, 55.58); assert.ok(o.review_reasons.includes("total disagrees with second read"));
+  const { dateSanity } = await import("../vision.js");
+  const now = new Date("2026-10-02T12:00:00Z");
+  assert.ok(dateSanity({ receipt_date: "2024-06-14", review_reasons: [] }, now).review_reasons.includes("date looks wrong"));
+  assert.ok(dateSanity({ receipt_date: "2026-12-01", review_reasons: [] }, now).review_reasons.includes("date looks wrong"));
+  assert.equal(dateSanity({ receipt_date: "2026-09-20", review_reasons: [] }, now).review_reasons.length, 0);
   // integration: stub Anthropic API
   let mode = "ok";
   const srv = http.createServer((req, res) => {

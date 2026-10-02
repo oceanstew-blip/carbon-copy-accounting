@@ -121,9 +121,17 @@ export function applyVision(tess,v){
   return out;
 }
 
+// A receipt dated months ago (or in the future) is almost always a misread or a wrong printer clock.
+export function dateSanity(d,today=new Date()){
+  if(!d?.receipt_date)return d;
+  const days=(today-new Date(`${d.receipt_date}T12:00:00Z`))/864e5;
+  if((days>100||days<-3)&&!d.review_reasons.includes("date looks wrong"))d={...d,review_reasons:[...d.review_reasons,"date looks wrong"]};
+  return d;
+}
+
 // Tesseract result in, best available result out.
 export async function withVision(tess,buffers,opts){
-  if(!visionEnabled())return tess;
-  try{return applyVision(tess,await visionRead(buffers,opts))}
-  catch(e){console.error("VISION_READ_FAILED",e.message);return tess}
+  if(!visionEnabled())return dateSanity(tess);
+  try{return dateSanity(applyVision(tess,await visionRead(buffers,opts)))}
+  catch(e){console.error("VISION_READ_FAILED",e.message);return dateSanity(tess)}
 }
