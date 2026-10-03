@@ -1402,15 +1402,20 @@ async function saveReceiptPages(pages,{autoGrouped=false,original=null,extraReas
   const combined=original?{buffer:original.buffer,content_type:original.mime,file_name:original.name}:await combineReceiptImages(pages.map((p)=>({buffer:p.buffer,mimetype:typeOfName(p.name,"image/jpeg"),originalname:p.name})));
   const mime=combined.content_type,full=combined.buffer;
   const pay=(d.detected_payment_method&&d.detected_payment_method!=="credit_card")?d.detected_payment_method:"credit_card";
+  // Auto-confirm only a clean read: a credit-card receipt with vendor, date and total all found, the total backed by a
+  // second source, and nothing flagged. Cash/check/wire post a transaction and anything flagged stays for the captain.
+  const autoConfirm=pay==="credit_card"&&!reasons.length&&Boolean(d.vendor)&&Boolean(d.receipt_date)&&d.amount!=null&&d.total_corroborated===true;
+  const autoCategory=autoConfirm&&d.suggested_category?(await pool.query("SELECT id FROM categories WHERE name=$1 LIMIT 1",[d.suggested_category])).rows[0]?.id||null:null;
   const finalName=receiptFileName(d.vendor,d.receipt_date,d.amount,mime,combined.file_name||pages[0].name);
   const guess=JSON.stringify({vendor:d.vendor,date:d.receipt_date,amount:d.amount,payment:d.detected_payment_method,category:d.suggested_category,flags:reasons});
   const client=await pool.connect();let id;
   try{
     await client.query("BEGIN");
     const q=await client.query(`INSERT INTO receipts(transaction_id,file_name,content_type,file_size,file_data,receipt_date,vendor,amount,category_id,file_sha256,receipt_text,expires_at,payment_method,review_required,ocr_confidence,ocr_field_score,ocr_review_reasons,ocr_guess)
-      VALUES(NULL,$1,$2,$3,$4,$5,$6,$7,NULL,$8,$9,NOW()+INTERVAL '60 days',$10,true,$11,$12,$13,$14) RETURNING id`,
-      [finalName,mime,full.length,full,d.receipt_date,d.vendor,d.amount,groupSha,d.receipt_text,pay,d.confidence==null?null:Math.round(d.confidence),d.field_score,reasons.join(","),guess]);
+      VALUES(NULL,$1,$2,$3,$4,$5,$6,$7,$15,$8,$9,NOW()+INTERVAL '60 days',$10,$16,$11,$12,$13,$14) RETURNING id`,
+      [finalName,mime,full.length,full,d.receipt_date,d.vendor,d.amount,groupSha,d.receipt_text,pay,d.confidence==null?null:Math.round(d.confidence),d.field_score,reasons.join(","),guess,autoCategory,!autoConfirm]);
     id=q.rows[0].id;
+    if(autoConfirm)await client.query("INSERT INTO audit_log(actor,action,entity_type,entity_id,old_data,new_data,reason,source) VALUES('system','auto_confirm','receipt',$1,NULL,$2,$3,'saveReceiptPages')",[String(id),JSON.stringify({vendor:d.vendor,date:d.receipt_date,amount:d.amount,category_id:autoCategory}),"Clean read: vendor, date and total found, total corroborated, nothing flagged"]);
     for(const [i,p] of pages.entries())await client.query("INSERT INTO receipt_pages(receipt_id,page_no,file_name,file_sha256,file_data,raw) VALUES($1,$2,$3,$4,$5,$6)",[id,i+1,p.name,p.sha,p.buffer,p.raw?JSON.stringify(p.raw):null]);
     await client.query("COMMIT");
   }catch(e){await client.query("ROLLBACK");throw e}finally{client.release()}
