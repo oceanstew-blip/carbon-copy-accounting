@@ -982,6 +982,13 @@ app.get("/api/receipts-trash",async(_req,res,next)=>{try{
     FROM receipts_trash ORDER BY deleted_at DESC,id DESC`);
   res.json({rows:q.rows})
 }catch(e){next(e)}});
+app.post("/api/receipts-trash/empty",async(req,res,next)=>{try{
+  // Permanent. The caller must send {confirm:"EMPTY"} so a stray request can't wipe the Trash.
+  if(!req.body||req.body.confirm!=="EMPTY")return res.status(400).json({error:"Send confirm: EMPTY to empty the Trash"});
+  const q=await pool.query("DELETE FROM receipts_trash RETURNING id,receipt->>'file_name' file_name,receipt->>'vendor' vendor,receipt->>'amount' amount,receipt->>'receipt_date' receipt_date");
+  await audit("captain","empty_trash","receipt",null,{count:q.rowCount,receipts:q.rows},null,{source:"POST /api/receipts-trash/empty"});
+  res.json({ok:true,deleted:q.rowCount})
+}catch(e){next(e)}});
 app.get("/api/receipts-trash/:id/file",async(req,res,next)=>{try{
   const r=(await pool.query("SELECT receipt->>'content_type' ct,receipt->>'file_data' fd FROM receipts_trash WHERE id=$1",[Number(req.params.id)])).rows[0];
   if(!r||!r.fd)return res.sendStatus(404);

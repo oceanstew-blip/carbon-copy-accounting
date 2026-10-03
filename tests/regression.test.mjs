@@ -340,6 +340,24 @@ test("trash can: an unmatched receipt moves to the trash, leaves every list, res
   assert.equal(res.status, 409);
 });
 
+test("empty trash: refuses without confirmation, then permanently clears the trash and logs it", async () => {
+  const tag = "EmptyTest" + crypto.randomUUID().slice(0, 8);
+  const id = await insertBareReceipt({ vendor: tag, amount: 5, receipt_date: "2026-09-12" });
+  let res = await apiFetch(`/api/receipts/${id}/trash`, { method: "POST" });
+  assert.equal(res.status, 200);
+  res = await apiFetch("/api/receipts-trash/empty", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+  assert.equal(res.status, 400);
+  let trash = await (await apiFetch("/api/receipts-trash")).json();
+  assert.ok(trash.rows.some((r) => String(r.id) === String(id)), "unconfirmed request must not delete anything");
+  res = await apiFetch("/api/receipts-trash/empty", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirm: "EMPTY" }) });
+  assert.equal(res.status, 200, await res.clone().text());
+  assert.ok((await res.json()).deleted >= 1);
+  trash = await (await apiFetch("/api/receipts-trash")).json();
+  assert.equal(trash.rows.length, 0);
+  const a = (await pool.query("SELECT 1 FROM audit_log WHERE action='empty_trash' LIMIT 1")).rows;
+  assert.equal(a.length, 1, "emptying the trash must be audited");
+});
+
 test("vendor names from the reader are tidied to one clean line", () => {
   assert.equal(tidyVendor("THE\nHOME\nDEPOT\n@"), "THE HOME DEPOT");
   assert.equal(tidyVendor("  Signs, Engraving & More!!  "), "Signs, Engraving & More!!");

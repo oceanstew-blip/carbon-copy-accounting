@@ -154,13 +154,22 @@ function bindTransactionControls(){
 }
 
 let trashRows=[];
+document.addEventListener('click',(e)=>{if(e.target&&e.target.id==='emptyTrash')emptyTrash();});
 async function loadTrash(){
   const box=$('#receiptTrash'); if(!box) return;
   trashRows=(await api('receipts-trash')).rows||[];
   renderTrash();
 }
+async function emptyTrash(){
+  if(!trashRows.length){alert('The Trash is already empty.');return;}
+  if(!confirm('Permanently delete all '+trashRows.length+' receipts in the Trash? This cannot be undone.'))return;
+  try{const r=await api('receipts-trash/empty',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirm:'EMPTY'})});toast(r.deleted+' receipts permanently deleted');}
+  catch(e){alert(e.message||'Could not empty the Trash');return;}
+  await loadTrash();
+}
 function renderTrash(){
   const box=$('#receiptTrash'); if(!box) return;
+  const eb=$('#emptyTrash'); if(eb) eb.disabled=!trashRows.length;
   const q=(($('#trashSearch')&&$('#trashSearch').value)||'').trim().toLowerCase();
   const rows=trashRows.filter((r)=>!q||[r.id,r.vendor,r.file_name,r.amount,r.receipt_date].join(' ').toLowerCase().includes(q));
   box.innerHTML=rows.length?rows.map((r)=>
