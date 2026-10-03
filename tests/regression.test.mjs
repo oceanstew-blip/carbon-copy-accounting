@@ -303,14 +303,19 @@ test("strong match (same-day + vendor text match) auto-links on next transaction
 test("trash can: an unmatched receipt moves to the trash, leaves every list, restores intact; matched receipts are protected", async () => {
   const tag = "TrashTest" + crypto.randomUUID().slice(0, 8);
   const id = await insertBareReceipt({ vendor: tag, amount: 33.1, receipt_date: "2026-09-12" });
+  const bytes = crypto.randomBytes(2048); // a real file body: it must survive the trip through the trash byte for byte
+  await pool.query("UPDATE receipts SET file_data=$1,file_size=$2,content_type='application/pdf' WHERE id=$3", [bytes, bytes.length, id]);
+  await pool.query("INSERT INTO receipt_pages(receipt_id,page_no,file_name,file_sha256,file_data) VALUES($1,1,'p1.jpg','x',$2)", [id, bytes.subarray(0, 64)]);
   let res = await apiFetch(`/api/receipts/${id}/trash`, { method: "POST" });
   assert.equal(res.status, 200, await res.clone().text());
+  const viewed = Buffer.from(await (await apiFetch(`/api/receipts-trash/${id}/file`)).arrayBuffer());
+  assert.ok(viewed.equals(bytes), "the trashed file must be viewable and identical");
   let inbox = await (await apiFetch("/api/receipt-inbox")).json();
   assert.ok(!inbox.rows.some((r) => r.id === id), "trashed receipt must leave the inbox");
   let list = await (await apiFetch("/api/transactions?month=2026-09")).json();
   assert.ok(!list.pending.some((p) => p.receipt_id === id), "trashed receipt must leave the pending rows");
   let trash = await (await apiFetch("/api/receipts-trash")).json();
-  assert.ok(trash.rows.some((r) => Number(r.id) === id && r.vendor === tag), "receipt should be listed in the trash");
+  assert.ok(trash.rows.some((r) => String(r.id) === String(id) && r.vendor === tag), "receipt should be listed in the trash");
   res = await apiFetch(`/api/receipts-trash/${id}/restore`, { method: "POST" });
   assert.equal(res.status, 200, await res.clone().text());
   inbox = await (await apiFetch("/api/receipt-inbox")).json();
@@ -318,8 +323,14 @@ test("trash can: an unmatched receipt moves to the trash, leaves every list, res
   assert.ok(back, "restored receipt should be back in the inbox");
   assert.equal(back.vendor, tag);
   assert.equal(Number(back.amount), 33.1);
+  const restored = (await pool.query("SELECT file_data,content_type FROM receipts WHERE id=$1", [id])).rows[0];
+  assert.ok(restored.file_data.equals(bytes), "restored file must be byte-identical");
+  assert.equal(restored.content_type, "application/pdf");
+  const pg = (await pool.query("SELECT file_data FROM receipt_pages WHERE receipt_id=$1", [id])).rows;
+  assert.equal(pg.length, 1, "restored receipt keeps its pages");
+  assert.ok(pg[0].file_data.equals(bytes.subarray(0, 64)));
   trash = await (await apiFetch("/api/receipts-trash")).json();
-  assert.ok(!trash.rows.some((r) => Number(r.id) === id), "restored receipt must leave the trash");
+  assert.ok(!trash.rows.some((r) => String(r.id) === String(id)), "restored receipt must leave the trash");
   // A receipt attached to a transaction cannot be trashed.
   const free = (await pool.query("SELECT t.id FROM transactions t WHERE NOT EXISTS(SELECT 1 FROM receipts r WHERE r.transaction_id=t.id) LIMIT 1")).rows[0];
   assert.ok(free, "need a transaction without a receipt for this check");
