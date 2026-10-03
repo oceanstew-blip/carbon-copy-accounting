@@ -9,6 +9,7 @@ import { promises as fsp } from "fs";
 import { ocrRaw, interpretRaw, combineRaws, groupLoosePhotos, pdfToImages, toReadable, isHeic, getOcrWorker, isoReceiptDate, amountFromLine, detectPaymentMethodFromText, suggestedCategoryFromText, labeledAmount, parseOcrReceipt, mergeOcrFields, chooseBestAmount, ocrImage } from "./ocr.js";
 import { AwsClient } from "aws4fetch";
 import ExcelJS from "exceljs";
+import archiver from "archiver";
 import zlib from "zlib";
 import { readFileSync } from "node:fs";
 import { capitalOneCsv, initialRules, driveReceipts } from "./seed.js";
@@ -1262,6 +1263,102 @@ app.get("/api/export/register",async(req,res,next)=>{try{
   res.set("Content-Disposition",`attachment; filename="${V.slug}-register-${month}.csv"`);
   res.send(lines.join("\n"));
 }catch(e){next(e)}});
+
+// Office package: ONE zip with the month's Excel register and every receipt file, ready to send to the office.
+// Each register row links to its receipt file in the Receipts folder. Receipts are removed from the app after 60 days,
+// so this zip is the permanent copy: send it every month.
+app.get("/api/export/office-package",async(req,res,next)=>{try{
+  const {month,start,next:n}=monthBounds(req.query.month);
+  const tx=(await pool.query(`SELECT t.id,t.transaction_date,COALESCE(NULLIF(t.vendor_normalized,''),t.vendor_raw) vendor,t.amount,c.name category_name,
+      t.payment_method,COALESCE(cd.last4,t.payment_reference) card_or_reference,t.captain_reviewed,t.approval_status,t.notes,
+      r.id receipt_id,r.content_type,r.purged_at,(r.file_data IS NOT NULL) has_file
+    FROM transactions t LEFT JOIN categories c ON c.id=t.category_id LEFT JOIN cards cd ON cd.id=t.card_id LEFT JOIN receipts r ON r.transaction_id=t.id
+    WHERE t.status='posted' AND t.transaction_date >= $1::date AND t.transaction_date < $2::date ORDER BY t.transaction_date,t.id`,[start,n])).rows;
+  const loose=(await pool.query(`SELECT r.id,r.receipt_date,r.vendor,r.amount,r.payment_method,r.content_type,r.purged_at,(r.file_data IS NOT NULL) has_file
+    FROM receipts r WHERE r.transaction_id IS NULL AND r.receipt_date >= $1::date AND r.receipt_date < $2::date ORDER BY r.receipt_date,r.id`,[start,n])).rows;
+  const toDate=(v)=>v instanceof Date?v.toISOString().slice(0,10):v;
+  const label=String(V.vesselName||V.appName||"Vessel").replace(/[^A-Za-z0-9 ]+/g,"").trim()||"Vessel";
+  const FOLDER="Receipts/",LOOSE="Receipts/Not yet matched to a card charge/";
+  // A readable, unique name for every receipt file: "Vendor - 2026-08-06 - $196.53.pdf"
+  const taken=new Set(),files=[];
+  const place=(folder,id,vendor,date,amount,mime)=>{
+    const base=receiptFileName(vendor,date,amount,mime,""),dot=base.lastIndexOf("."),stem=base.slice(0,dot),ext=base.slice(dot);
+    let name=stem+ext,i=2;
+    while(taken.has((folder+name).toLowerCase()))name=`${stem} (${i++})${ext}`;
+    taken.add((folder+name).toLowerCase());
+    files.push({id,path:folder+name});
+    return folder+name;
+  };
+  const link=(p)=>({text:p.slice(p.lastIndexOf("/")+1),hyperlink:encodeURI(p)});
+  for(const r of tx)r.path=r.receipt_id&&r.has_file?place(FOLDER,r.receipt_id,r.vendor,r.transaction_date,r.amount,r.content_type):null;
+  for(const r of loose)r.path=r.has_file?place(LOOSE,r.id,r.vendor,r.receipt_date,r.amount,r.content_type):null;
+  const receiptCell=(r)=>r.path?link(r.path):r.receipt_id?(r.purged_at?"Removed after 60 days":"File not available"):"MISSING";
+
+  const wb=new ExcelJS.Workbook();
+  const bold=(row)=>{row.font={bold:true}};
+  const reg=wb.addWorksheet("Register");
+  reg.columns=["Date","Vendor","Amount","Category","Payment Method","Card/Reference","Captain Reviewed","Approval Status","Notes","Receipt"].map((header)=>({header,width:header==="Notes"||header==="Vendor"?34:header==="Receipt"?46:16}));
+  bold(reg.getRow(1));
+  let total=0;
+  for(const r of tx){
+    total+=Number(r.amount);
+    const row=reg.addRow([toDate(r.transaction_date),r.vendor,Number(r.amount),r.category_name||"Uncategorized",r.payment_method,r.card_or_reference,r.captain_reviewed?"Yes":"No",r.approval_status,r.notes,receiptCell(r)]);
+    if(r.path)row.getCell(10).font={color:{argb:"FF0563C1"},underline:true};
+    else row.getCell(10).fill={type:"pattern",pattern:"solid",fgColor:{argb:"FFFFF2CC"}};
+  }
+  const totalRow=reg.addRow(["Total","",Math.round(total*100)/100]);bold(totalRow);
+  reg.getColumn(3).numFmt="#,##0.00";
+  reg.views=[{state:"frozen",ySplit:1}];
+
+  const cat=wb.addWorksheet("By Category");
+  cat.columns=[{header:"Category",width:34},{header:"Transactions",width:14},{header:"Total",width:16}];bold(cat.getRow(1));
+  const byCat=new Map();
+  for(const r of tx){const k=r.category_name||"Uncategorized",e=byCat.get(k)||{count:0,sum:0};e.count++;e.sum+=Number(r.amount);byCat.set(k,e)}
+  for(const [k,e] of [...byCat.entries()].sort((a,b)=>b[1].sum-a[1].sum))cat.addRow([k,e.count,Math.round(e.sum*100)/100]);
+  bold(cat.addRow(["Total",tx.length,Math.round(total*100)/100]));
+  cat.getColumn(3).numFmt="#,##0.00";
+
+  const missing=tx.filter((r)=>!r.path);
+  const miss=wb.addWorksheet("Missing receipts");
+  miss.columns=[{header:"Date",width:14},{header:"Vendor",width:34},{header:"Amount",width:14},{header:"Payment Method",width:16},{header:"Status",width:26}];bold(miss.getRow(1));
+  for(const r of missing)miss.addRow([toDate(r.transaction_date),r.vendor,Number(r.amount),r.payment_method,receiptCell(r)]);
+  if(!missing.length)miss.addRow(["Every charge this month has a receipt."]);
+  miss.getColumn(3).numFmt="#,##0.00";
+
+  const lo=wb.addWorksheet("Receipts not matched");
+  lo.columns=[{header:"Date",width:14},{header:"Vendor",width:34},{header:"Amount",width:14},{header:"Payment Method",width:16},{header:"Receipt",width:46}];bold(lo.getRow(1));
+  for(const r of loose)lo.addRow([toDate(r.receipt_date),r.vendor||"",r.amount==null?"":Number(r.amount),r.payment_method||"",r.path?link(r.path):(r.purged_at?"Removed after 60 days":"File not available")]);
+  if(!loose.length)lo.addRow(["Every receipt this month is matched to a charge."]);
+  lo.getColumn(3).numFmt="#,##0.00";
+
+  const readme=`${label} - expense package for ${month}
+Prepared ${new Date().toISOString().slice(0,10)}
+
+Charges: ${tx.length}   Total: $${(Math.round(total*100)/100).toFixed(2)}
+Receipts included: ${files.length}   Charges with no receipt: ${missing.length}   Receipts not yet matched to a charge: ${loose.length}
+
+What is in this package
+  ${label} - Expenses ${month}.xlsx   The expense register. Click a link in the Receipt column to open that receipt.
+                                      Other sheets: By Category, Missing receipts, Receipts not matched.
+  Receipts\\                           Every receipt file, named Vendor - date - amount.
+  Receipts\\Not yet matched to a card charge\\   Receipts the captain has filed that have no card charge yet.
+
+Keep this folder together: the links in the spreadsheet point to the Receipts folder next to it.
+`;
+  res.set("Content-Type","application/zip");
+  res.set("Content-Disposition",`attachment; filename="${label} - Office Package ${month}.zip"`);
+  const zip=archiver("zip",{zlib:{level:6}});
+  zip.on("error",(err)=>{console.error("OFFICE_PACKAGE_FAILED",err.message);res.destroy(err)});
+  zip.pipe(res);
+  zip.append(Buffer.from(await wb.xlsx.writeBuffer()),{name:`${label} - Expenses ${month}.xlsx`});
+  zip.append(readme,{name:"README.txt"});
+  for(const f of files){ // one file at a time: a month of receipts is never all held in memory
+    const row=(await pool.query("SELECT file_data FROM receipts WHERE id=$1",[f.id])).rows[0];
+    if(row?.file_data)zip.append(row.file_data,{name:f.path});
+  }
+  await zip.finalize();
+  audit("captain","export","office_package",month,null,{charges:tx.length,receipts:files.length,missing:missing.length,unmatched:loose.length},{source:"GET /api/export/office-package"}).catch((e)=>console.error("AUDIT_FAILED",e.message));
+}catch(e){if(res.headersSent){res.destroy(e);return}next(e)}});
 
 app.get("/api/export/exceptions",async(req,res,next)=>{try{
   const {month,start,next:n}=monthBounds(req.query.month);

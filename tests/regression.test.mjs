@@ -1109,6 +1109,57 @@ test("a single receipt photo is not cut", async () => {
   assert.equal(g.status, "ingested"); assert.ok(!g.split, "one receipt must stay one receipt");
 });
 
+test("office package: one zip with the Excel register, linked receipt files, missing and unmatched receipts", async () => {
+  const { readFileSync } = await import("node:fs");
+  const sharp = (await import("sharp")).default;
+  const JSZip = (await import("jszip")).default;
+  const png = await sharp(readFileSync(new URL("./fixtures/ocr-self-test-receipt.png", import.meta.url))).extend({ top: 9, background: "white" }).png().toBuffer();
+  const png2 = await sharp(readFileSync(new URL("./fixtures/ocr-self-test-receipt.png", import.meta.url))).extend({ top: 17, background: "white" }).png().toBuffer();
+  const post = async (fields, pic = png) => {
+    const f = new FormData(); f.append("files", new Blob([pic]), "r.png");
+    for (const [k, v] of Object.entries(fields)) f.append(k, v);
+    const r = await fetch(BASE + "/api/receipts", { method: "POST", headers: { Authorization: AUTH }, body: f });
+    assert.ok(r.status === 200 || r.status === 201, "receipt upload " + r.status); return r.json();
+  };
+  // a cash charge with its receipt, a card receipt not matched to any charge yet, and a cash charge with no receipt at all
+  await post({ receipt_date: "2026-07-15", vendor: "Pkg Probe Marine", amount: "12.34", payment_method: "cash" });
+  await post({ receipt_date: "2026-07-18", vendor: "Pkg Probe Card Shop", amount: "56.78", payment_method: "credit_card" }, png2);
+  const noReceipt = await apiFetch("/api/transactions", { method: "POST", body: JSON.stringify({ transaction_date: "2026-07-16", vendor_raw: "Pkg Probe No Receipt", amount: 9.99, payment_method: "cash", external_id: "pkg-" + crypto.randomUUID() }) });
+  assert.equal(noReceipt.status, 201);
+
+  const res = await apiFetch("/api/export/office-package?month=2026-07");
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get("content-type"), /application\/zip/);
+  assert.match(res.headers.get("content-disposition"), /Office Package 2026-07\.zip/);
+  const zip = await JSZip.loadAsync(Buffer.from(await res.arrayBuffer()));
+  const names = Object.keys(zip.files).filter((n) => !zip.files[n].dir);
+  assert.ok(names.includes("README.txt"));
+  const xlsxName = names.find((n) => /Expenses 2026-07\.xlsx$/.test(n));
+  assert.ok(xlsxName, "spreadsheet is in the zip: " + names.join(" | "));
+  const receipt = names.find((n) => n.startsWith("Receipts/") && /Pkg Probe Marine/.test(n));
+  assert.ok(receipt, "the cash receipt file is in Receipts/: " + names.join(" | "));
+  assert.ok(names.some((n) => n.startsWith("Receipts/Not yet matched to a card charge/") && /Pkg Probe Card Shop/.test(n)), "unmatched card receipt is in its own folder: " + names.join(" | "));
+  assert.ok((await zip.files[receipt].async("nodebuffer")).length > 100, "receipt file has its picture");
+
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(await zip.files[xlsxName].async("nodebuffer"));
+  assert.deepEqual(wb.worksheets.map((w) => w.name), ["Register", "By Category", "Missing receipts", "Receipts not matched"]);
+  const reg = wb.getWorksheet("Register");
+  const rowOf = (v) => { let found = null; reg.eachRow((row) => { if (row.getCell(2).value === v) found = row; }); return found; };
+  const marine = rowOf("Pkg Probe Marine");
+  assert.ok(marine, "register has the cash charge");
+  assert.equal(marine.getCell(3).value, 12.34);
+  const cell = marine.getCell(10).value;
+  assert.equal(decodeURI(cell.hyperlink), receipt, "the Receipt cell links to the file in the zip");
+  assert.equal(rowOf("Pkg Probe No Receipt").getCell(10).value, "MISSING");
+  let missingListed = false;
+  wb.getWorksheet("Missing receipts").eachRow((row) => { if (row.getCell(2).value === "Pkg Probe No Receipt") missingListed = true; });
+  assert.ok(missingListed, "Missing receipts sheet lists the charge without a receipt");
+  let unmatchedListed = false;
+  wb.getWorksheet("Receipts not matched").eachRow((row) => { if (row.getCell(2).value === "Pkg Probe Card Shop") unmatchedListed = true; });
+  assert.ok(unmatchedListed, "Receipts not matched sheet lists the card receipt");
+});
+
 test("test-receipt cleanup: preview first, removes a manual receipt + its transaction, audited, closed months untouched", async () => {
   const { readFileSync } = await import("node:fs");
   const sharp = (await import("sharp")).default;
