@@ -1404,7 +1404,8 @@ async function saveReceiptPages(pages,{autoGrouped=false,original=null,extraReas
   const pay=(d.detected_payment_method&&d.detected_payment_method!=="credit_card")?d.detected_payment_method:"credit_card";
   // Auto-confirm only a clean read: a credit-card receipt with vendor, date and total all found, the total backed by a
   // second source, and nothing flagged. Cash/check/wire post a transaction and anything flagged stays for the captain.
-  const autoConfirm=pay==="credit_card"&&!reasons.length&&Boolean(d.vendor)&&Boolean(d.receipt_date)&&d.amount!=null&&d.total_corroborated===true;
+  // A missing category alone does not hold a receipt back: it stays uncategorized for a vendor rule or the captain.
+  const autoConfirm=pay==="credit_card"&&!reasons.some((r)=>r!=="category")&&Boolean(d.vendor)&&Boolean(d.receipt_date)&&d.amount!=null&&d.total_corroborated===true;
   const autoCategory=autoConfirm&&d.suggested_category?(await pool.query("SELECT id FROM categories WHERE name=$1 LIMIT 1",[d.suggested_category])).rows[0]?.id||null:null;
   const finalName=receiptFileName(d.vendor,d.receipt_date,d.amount,mime,combined.file_name||pages[0].name);
   const guess=JSON.stringify({vendor:d.vendor,date:d.receipt_date,amount:d.amount,payment:d.detected_payment_method,category:d.suggested_category,flags:reasons});
