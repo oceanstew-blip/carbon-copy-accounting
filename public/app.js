@@ -43,6 +43,19 @@ async function loadBootstrap(){
   renderRules();
   renderReceiptForm();
   renderMailSettings();
+  renderDriveBackup();
+}
+
+async function renderDriveBackup(){
+  const box=$('#driveBackup');
+  if(!box) return;
+  let v={};
+  try{v=await api('vessel')}catch(e){return}
+  if(!v.driveAccount&&!v.driveFolderUrl) return;
+  $('#driveBackupText').textContent=v.driveAccount?('Receipts are saved automatically to the Google Drive of '+v.driveAccount+' (folder: '+(v.driveFolderName||'Receipts')+'). Sign in to that Google account to see them.'):'Receipts are saved automatically to Google Drive.';
+  const l=$('#driveFolderLink');
+  if(l&&v.driveFolderUrl){l.href=v.driveFolderUrl;l.hidden=false}
+  box.hidden=false;
 }
 
 function renderMailSettings(){

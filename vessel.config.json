@@ -3,5 +3,7 @@
   "appName": "Quixotic Accounting",
   "slug": "carbon-copy",
   "cardLabel": "Capital One",
-  "cardLast4": "0945"
+  "cardLast4": "0945",
+  "driveAccount": "seaology@gmail.com",
+  "driveFolderName": "Quixotic Receipts"
 }
