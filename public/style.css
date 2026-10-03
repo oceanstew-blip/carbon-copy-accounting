@@ -107,6 +107,7 @@ tbody td b{font-family:'IBM Plex Mono',monospace;font-weight:700}
 .receipt-link{color:var(--ocean);font-weight:600;text-decoration:none}
 .receipt-link:hover{text-decoration:underline}
 .missing{color:var(--amber);font-weight:600;cursor:pointer}
+tr.pending td{font-style:italic;background:rgba(0,0,0,.03);color:var(--ink-dim)}
 
 /* ---- Receipt items ---- */
 .stack{display:flex;flex-direction:column;gap:12px}

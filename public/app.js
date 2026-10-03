@@ -1,6 +1,7 @@
 
 let bootstrap={categories:[],cards:[],rules:[]};
 let transactions=[];
+let pendingReceipts=[]; // credit-card receipts waiting for their card charge; never part of totals or exports
 let receiptInbox=[];
 let editingReceiptId=null;
 let systemCheckRunning=false;
@@ -79,6 +80,7 @@ function renderBars(sel,rows){
 async function loadTransactions(){
   const d=await api('transactions?month='+encodeURIComponent(currentMonth()));
   transactions=d.rows||[];
+  pendingReceipts=d.pending||[];
   renderTransactions();
 }
 
@@ -110,14 +112,21 @@ function renderTransactions(){
     return x<y?-dir:x>y?dir:0;
   });
 
-  body.innerHTML=rows.length?rows.map((t)=>{
+  // Pending card receipts sit above the real rows (all-transactions view only) and are visibly not posted.
+  const pendingHtml=(filter==='all'?pendingReceipts:[]).map((p)=>
+    '<tr class="pending"><td>'+esc(String(p.transaction_date||'').slice(0,10))+'</td><td>'+esc(p.vendor_raw||p.file_name||'Receipt')+'</td><td><b>'+money(p.amount)+'</b></td><td>'+esc(p.category_name||'Uncategorized')+'</td>'+
+    '<td><span class="badge">Awaiting card match</span>'+(p.review_required?' <span class="muted">· unconfirmed</span>':'')+'</td>'+
+    '<td><a class="receipt-link" target="_blank" href="/api/receipts/'+p.receipt_id+'">'+esc(p.file_name||'Receipt')+'</a></td>'+
+    '<td><button class="pending-fix" data-id="'+p.receipt_id+'" type="button">Review / Fix</button></td></tr>').join('');
+
+  body.innerHTML=pendingHtml+(rows.length?rows.map((t)=>{
     const options='<option value="">Uncategorized</option>'+bootstrap.categories.map((c)=>'<option value="'+c.id+'" '+(Number(t.category_id)===Number(c.id)?'selected':'')+'>'+esc(c.name)+'</option>').join('');
     const receipt=t.receipt_id
       ? '<a class="receipt-link" target="_blank" href="/api/receipts/'+t.receipt_id+'">'+esc(t.file_name||'Receipt')+'</a>'
       : '<label class="missing">Upload<input class="receipt" data-id="'+t.id+'" type="file" accept="image/*,.pdf,.heic,.heif" hidden></label>';
     const payment=paymentLabel(t)+(t.payment_reference?' · '+esc(t.payment_reference):'');
     return '<tr><td>'+esc(String(t.transaction_date||'').slice(0,10))+'</td><td>'+esc(t.vendor_normalized||t.vendor_raw||'')+'</td><td><b>'+money(t.amount)+'</b></td><td><select class="cat" data-id="'+t.id+'">'+options+'</select></td><td>'+payment+'</td><td>'+receipt+'</td><td><input class="review" data-id="'+t.id+'" type="checkbox" '+(t.captain_reviewed?'checked':'')+'></td></tr>';
-  }).join(''):'<tr><td colspan="7">No transactions yet.</td></tr>';
+  }).join(''):(pendingHtml?'':'<tr><td colspan="7">No transactions yet.</td></tr>'));
 
   bindTransactionControls();
 }
@@ -130,6 +139,10 @@ function bindTransactionControls(){
   $$('.review').forEach((el)=>el.addEventListener('change',async()=>{
     await api('transactions/'+el.dataset.id,{method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify({captain_reviewed:el.checked})});
     await loadDashboard();
+  }));
+  $$('.pending-fix').forEach((el)=>el.addEventListener('click',async()=>{
+    showView('receipts'); await loadReceiptInbox();
+    const b=document.querySelector('.edit-receipt[data-id="'+el.dataset.id+'"]'); if(b) b.click();
   }));
   $$('.receipt').forEach((el)=>el.addEventListener('change',async()=>{
     const f=el.files&&el.files[0]; if(!f) return;

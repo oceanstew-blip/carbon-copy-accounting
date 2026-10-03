@@ -299,6 +299,34 @@ test("strong match (same-day + vendor text match) auto-links on next transaction
   assert.equal(check.already_matched, true, "receipt should have auto-linked");
 });
 
+test("unmatched card receipt shows as pending in Transactions, then disappears once its charge arrives; never counted as posted", async () => {
+  const tag = "PendingTestMarine" + crypto.randomUUID().slice(0, 8);
+  const receiptId = await insertBareReceipt({ vendor: tag, amount: 61.25, receipt_date: "2026-09-21" });
+  const noDate = await insertBareReceipt({ vendor: "NoDate" + tag, amount: 9, receipt_date: null });
+  const cash = await insertBareReceipt({ vendor: "Cash" + tag, amount: 5, receipt_date: "2026-09-21", payment_method: "cash" });
+  let list = await (await apiFetch("/api/transactions?month=2026-09")).json();
+  assert.ok(list.pending.some((p) => p.receipt_id === receiptId && p.vendor_raw === tag), "card receipt with date+amount should be pending");
+  assert.ok(!list.pending.some((p) => p.receipt_id === noDate), "receipt with no date stays in review, not pending");
+  assert.ok(!list.pending.some((p) => p.receipt_id === cash), "cash receipts are never pending");
+  assert.ok(!list.rows.some((r) => r.vendor_raw === tag), "pending receipt must not appear among posted transactions");
+  await apiFetch("/api/transactions", {
+    method: "POST",
+    body: JSON.stringify({ transaction_date: "2026-09-21", vendor_raw: tag + " SUPPLY CO", amount: 61.25, external_id: "test-pending-" + crypto.randomUUID() }),
+  });
+  list = await (await apiFetch("/api/transactions?month=2026-09")).json();
+  assert.ok(!list.pending.some((p) => p.receipt_id === receiptId), "once matched, the receipt is no longer pending");
+});
+
+test("receipt inbox: only confirmed, readable card receipts count as waiting; unconfirmed ones need review", async () => {
+  const tag = "BucketTest" + crypto.randomUUID().slice(0, 8);
+  const unconfirmed = await insertBareReceipt({ vendor: tag, amount: 11, receipt_date: "2026-08-02" });
+  const confirmed = await insertBareReceipt({ vendor: tag + "ok", amount: 12, receipt_date: "2026-08-02" });
+  await pool.query("UPDATE receipts SET review_required=false WHERE id=$1", [confirmed]);
+  const inbox = await (await apiFetch("/api/receipt-inbox")).json();
+  assert.equal(inbox.rows.find((r) => r.id === unconfirmed)?.bucket, "review");
+  assert.equal(inbox.rows.find((r) => r.id === confirmed)?.bucket, "waiting");
+});
+
 test("ambiguous match (no vendor signal, tied candidates) does not auto-link", async () => {
   const tag = crypto.randomUUID().slice(0, 8);
   const receiptId = await insertBareReceipt({ vendor: null, amount: 17.77, receipt_date: "2026-09-21" });

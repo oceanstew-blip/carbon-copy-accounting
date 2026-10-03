@@ -526,7 +526,13 @@ app.get("/api/transactions",async(req,res,next)=>{try{
     t.approval_status,t.approval_date,t.approval_note,t.approved_by
     FROM transactions t LEFT JOIN categories c ON c.id=t.category_id LEFT JOIN cards cd ON cd.id=t.card_id LEFT JOIN receipts r ON r.transaction_id=t.id
     WHERE t.transaction_date >= $1::date AND t.transaction_date < $2::date ORDER BY t.transaction_date DESC,t.id DESC`,[start,n]);
-  res.json({rows:q.rows})
+  // Credit-card receipts with a date and amount that no card charge has claimed yet. Shown beside real
+  // transactions but kept in their own list: they are not posted, so no total or export may include them.
+  const p=await pool.query(`SELECT r.id receipt_id,r.receipt_date transaction_date,r.vendor vendor_raw,r.amount,r.file_name,r.review_required,c.id category_id,c.name category_name
+    FROM receipts r LEFT JOIN categories c ON c.id=r.category_id
+    WHERE r.transaction_id IS NULL AND r.payment_method='credit_card' AND r.amount IS NOT NULL AND r.receipt_date IS NOT NULL
+      AND r.receipt_date >= $1::date AND r.receipt_date < $2::date ORDER BY r.receipt_date DESC,r.id DESC`,[start,n]);
+  res.json({rows:q.rows,pending:p.rows})
 }catch(e){next(e)}});
 
 app.post("/api/transactions",async(req,res,next)=>{try{
@@ -731,7 +737,7 @@ app.get("/api/receipt-inbox",async(_req,res,next)=>{try{
   await repairOrphanNonCardReceipts();
   const q=await pool.query(`SELECT r.id,r.receipt_date,r.vendor,r.amount,r.file_name,r.created_at,r.expires_at,r.purged_at,r.receipt_text,r.payment_method,r.payment_reference,
       r.review_required,r.ocr_confidence,r.ocr_field_score,r.ocr_review_reasons,c.name category_name,c.id category_id,(SELECT COUNT(*)::int FROM receipt_pages p WHERE p.receipt_id=r.id) page_count,
-      CASE WHEN r.payment_method = 'credit_card' THEN 'waiting' ELSE 'review' END bucket
+      CASE WHEN r.payment_method = 'credit_card' AND NOT COALESCE(r.review_required,false) AND r.amount IS NOT NULL AND r.receipt_date IS NOT NULL THEN 'waiting' ELSE 'review' END bucket
     FROM receipts r LEFT JOIN categories c ON c.id=r.category_id WHERE r.transaction_id IS NULL ORDER BY COALESCE(r.receipt_date,r.created_at::date) DESC,r.id DESC`);
   res.json({rows:q.rows})
 }catch(e){next(e)}});
