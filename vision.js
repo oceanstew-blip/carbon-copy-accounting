@@ -14,6 +14,8 @@ export const visionEnabled=()=>azureOn()||Boolean(process.env.ANTHROPIC_API_KEY)
 export const visionEngine=()=>azureOn()?"azure-document-intelligence":process.env.ANTHROPIC_API_KEY?"claude-vision":null;
 const sleep=(ms)=>new Promise((r)=>setTimeout(r,ms));
 const money=(f)=>f?.valueCurrency?.amount??f?.valueNumber??null;
+// One line, single spaces, no stray symbols left on either end ("THE\nHOME\nDEPOT\n@" -> "THE HOME DEPOT").
+export const tidyVendor=(s)=>String(s||"").replace(/\s+/g," ").replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9.)!]+$/g,"").trim()||null;
 
 // Azure AI Document Intelligence, prebuilt receipt model. One document per call: a PDF goes up as-is,
 // several photos are stacked into one tall image first.
@@ -58,7 +60,7 @@ async function azureRead(buffers,{fetchImpl=fetch,original=null}={}){
     const d=docs[0].fields||{};
     const num=(x)=>x==null?null:Math.round(Number(x)*100)/100;
     return{
-      vendor:d.MerchantName?.valueString?.trim()||null,
+      vendor:tidyVendor(d.MerchantName?.valueString),
       receipt_date:/^\d{4}-\d{2}-\d{2}$/.test(d.TransactionDate?.valueDate||"")?d.TransactionDate.valueDate:null,
       amount:num(money(d.Total)),subtotal:num(money(d.Subtotal)),tax:num(money(d.TotalTax)),
       detected_payment_method:null,card_last4:null,total_page:null,multiple:docs.length>1,

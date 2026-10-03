@@ -970,6 +970,9 @@ app.patch("/api/receipts/:id",async(req,res,next)=>{try{
   const correctedFileName=receiptFileName(vendor,date,amount,current.content_type,current.file_name);
   await pool.query(`UPDATE receipts SET receipt_date=$1,vendor=$2,amount=$3,category_id=$4,receipt_text=$5,payment_method=$6,payment_reference=$7,review_required=false,file_name=$8 WHERE id=$9`,
     [date,vendor,amount,categoryId,receiptText,paymentMethod,paymentReference,correctedFileName,id]);
+  // Teach the app: the next receipt from this vendor arrives already categorized.
+  if(b.category_id&&categoryId&&vendor)await pool.query(`INSERT INTO vendor_rules(vendor_pattern,category_id) VALUES($1,$2)
+    ON CONFLICT(vendor_pattern) DO UPDATE SET category_id=EXCLUDED.category_id,approved=true`,[vendor,categoryId]);
 
   let createdTransactionId=null,matched=null;
   if(!current.transaction_id && paymentMethod!=="credit_card"){
@@ -1402,11 +1405,14 @@ async function saveReceiptPages(pages,{autoGrouped=false,original=null,extraReas
   const combined=original?{buffer:original.buffer,content_type:original.mime,file_name:original.name}:await combineReceiptImages(pages.map((p)=>({buffer:p.buffer,mimetype:typeOfName(p.name,"image/jpeg"),originalname:p.name})));
   const mime=combined.content_type,full=combined.buffer;
   const pay=(d.detected_payment_method&&d.detected_payment_method!=="credit_card")?d.detected_payment_method:"credit_card";
+  // Category: the text-based guess first, else whatever the captain taught the app for this vendor (vendor rules).
+  const catName=d.suggested_category||await ruleCategoryName(d.vendor);
+  const autoCategory=catName?(await pool.query("SELECT id FROM categories WHERE name=$1 AND active LIMIT 1",[catName])).rows[0]?.id||null:null;
+  if(autoCategory&&reasons.includes("category"))reasons.splice(reasons.indexOf("category"),1);
   // Auto-confirm only a clean read: a credit-card receipt with vendor, date and total all found, the total backed by a
   // second source, and nothing flagged. Cash/check/wire post a transaction and anything flagged stays for the captain.
   // A missing category alone does not hold a receipt back: it stays uncategorized for a vendor rule or the captain.
   const autoConfirm=pay==="credit_card"&&!reasons.some((r)=>r!=="category")&&Boolean(d.vendor)&&Boolean(d.receipt_date)&&d.amount!=null&&d.total_corroborated===true;
-  const autoCategory=autoConfirm&&d.suggested_category?(await pool.query("SELECT id FROM categories WHERE name=$1 LIMIT 1",[d.suggested_category])).rows[0]?.id||null:null;
   const finalName=receiptFileName(d.vendor,d.receipt_date,d.amount,mime,combined.file_name||pages[0].name);
   const guess=JSON.stringify({vendor:d.vendor,date:d.receipt_date,amount:d.amount,payment:d.detected_payment_method,category:d.suggested_category,flags:reasons});
   const client=await pool.connect();let id;
@@ -1422,6 +1428,12 @@ async function saveReceiptPages(pages,{autoGrouped=false,original=null,extraReas
   }catch(e){await client.query("ROLLBACK");throw e}finally{client.release()}
   const matched=pay==="credit_card"?await autoMatchReceipt(id):null;
   return{status:"ingested",id,pages:pages.length,matched_transaction_id:matched};
+}
+
+// The category the captain has taught the app for this vendor, if any (longest matching vendor rule wins).
+async function ruleCategoryName(vendor){
+  const v=String(vendor||"").trim();if(!v)return null;
+  return (await pool.query("SELECT c.name FROM vendor_rules vr JOIN categories c ON c.id=vr.category_id WHERE c.active AND vr.vendor_pattern<>'' AND $1 ILIKE '%'||vr.vendor_pattern||'%' ORDER BY length(vr.vendor_pattern) DESC LIMIT 1",[v])).rows[0]?.name||null;
 }
 
 // A scanner-app PDF is one receipt; its pages are rendered and read like photos. The PDF itself is what gets filed.

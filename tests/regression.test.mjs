@@ -12,6 +12,7 @@ import assert from "node:assert/strict";
 import { execSync } from "node:child_process";
 import crypto from "node:crypto";
 import { parseOcrReceipt, isoReceiptDate, detectPaymentMethodFromText } from "../ocr.js";
+import { tidyVendor } from "../vision.js";
 import ExcelJS from "exceljs";
 
 const APP_PORT = Number(process.env.PORT || 8321);
@@ -297,6 +298,15 @@ test("strong match (same-day + vendor text match) auto-links on next transaction
   });
   const check = await (await apiFetch(`/api/receipts/${receiptId}/candidates`)).json();
   assert.equal(check.already_matched, true, "receipt should have auto-linked");
+});
+
+test("vendor names from the reader are tidied to one clean line", () => {
+  assert.equal(tidyVendor("THE\nHOME\nDEPOT\n@"), "THE HOME DEPOT");
+  assert.equal(tidyVendor("  Signs, Engraving & More!!  "), "Signs, Engraving & More!!");
+  assert.equal(tidyVendor("FSP*MARINA ONE"), "FSP*MARINA ONE");
+  assert.equal(tidyVendor("Wawa #5194 -"), "Wawa #5194");
+  assert.equal(tidyVendor(null), null);
+  assert.equal(tidyVendor("@@@"), null);
 });
 
 test("a receipt that prints only the card's last four digits is read as a card payment (and phone numbers are not)", () => {
