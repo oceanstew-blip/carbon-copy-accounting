@@ -66,11 +66,17 @@ function setupFolderUpload(){
     const all=[...pick.files];
     const okType=/\.(jpe?g|png|webp|heic|heif|pdf)$/i,MAX=20*1024*1024;
     const rel=(f)=>f.webkitRelativePath||f.name;
-    const usable=all.filter((f)=>okType.test(f.name)&&!/(^|\/)Done\//.test(rel(f)));
+    // Skip a "Done" folder only when it sits INSIDE the picked folder (the watcher's archive). Picking Done itself must work.
+    const inDoneSubfolder=(f)=>rel(f).split('/').slice(1,-1).includes('Done');
+    const usable=all.filter((f)=>okType.test(f.name)&&!inDoneSubfolder(f));
     const tooBig=usable.filter((f)=>f.size>MAX);
     const files=usable.filter((f)=>f.size<=MAX).sort((a,b)=>rel(a).localeCompare(rel(b),undefined,{numeric:true}));
     const skipped=all.length-usable.length;
-    if(!files.length){out.textContent='No receipt photos or PDFs found in that folder.';pick.value='';return}
+    if(!files.length){
+      const rootName=(all[0]&&all[0].webkitRelativePath||'').split('/')[0]||'that folder';
+      const types=[...new Set(all.map((f)=>(f.name.match(/\.[^.]+$/)||['(no extension)'])[0].toLowerCase()))].slice(0,8).join(', ');
+      out.textContent=all.length?('Looked at '+all.length+' file'+(all.length===1?'':'s')+' in "'+rootName+'" but none were receipt photos or PDFs. File types seen: '+types+'.'):('The browser saw 0 files in "'+rootName+'". If the files are in Google Drive, wait for them to finish syncing and try again.');
+      pick.value='';return}
     if(!confirm('Upload '+files.length+' file'+(files.length===1?'':'s')+' from this folder? Each one is read and added as a receipt. Duplicates are skipped.')){pick.value='';return}
     btn.disabled=true;
     const tally={ingested:0,duplicate:0,failed:0},problems=[];
