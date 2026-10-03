@@ -32,7 +32,7 @@ Routine cycle: photograph/upload a receipt → OCR reads what it can → captain
 
 ## Brand Commitments
 
-Boat name "M/Y Quixotic" and the app name "Carbon Copy Accounting" are fixed. No logo, photography, or other brand assets exist yet — captain confirmed text/data-only for now, nothing to source or wait on.
+Boat name "M/Y Quixotic" and the app name "Quixotic Accounting" are fixed. No logo, photography, or other brand assets exist yet — captain confirmed text/data-only for now, nothing to source or wait on.
 
 ## Evidence on Hand
 

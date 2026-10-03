@@ -1,4 +1,4 @@
-// Regression suite per Carbon Copy Accounting stabilization brief, Priority 2.
+// Regression suite per Quixotic Accounting stabilization brief, Priority 2.
 // Boots the real app in-process against a throwaway Postgres and exercises it over HTTP.
 // Run with: npm test (tests/run.sh manages the Docker Postgres container and calls this).
 //

@@ -693,7 +693,7 @@ function wireStaticControls(){
     const head=['Date','Vendor','Amount','Category','Payment Method','Payment Reference','Receipt','Reviewed'];
     const rows=transactions.map((t)=>[t.transaction_date,t.vendor_normalized||t.vendor_raw,t.amount,t.category_name||'',t.payment_method||'credit_card',t.payment_reference||'',t.receipt_id?'Yes':'No',t.captain_reviewed?'Yes':'No']);
     const csv=[head,...rows].map((r)=>r.map((v)=>'"'+String(v??'').replaceAll('"','""')+'"').join(',')).join('\n');
-    const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));a.download='carbon-copy-'+currentMonth()+'.csv';a.click();
+    const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));a.download='quixotic-'+currentMonth()+'.csv';a.click();
   });
 
   if($('#runReport')) $('#runReport').addEventListener('click',async()=>{
