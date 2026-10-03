@@ -47,6 +47,8 @@ export function amountFromLine(line){
 export function detectPaymentMethodFromText(text){
   const t=String(text||"").toLowerCase();
   if(/\b(visa|mastercard|amex|american express|discover|credit card|debit|card ending|card #)\b|[x*]{4,}\s*\d{4}\b/i.test(t))return "credit_card";
+  // Receipts that only print the last four digits: "ending in 0945", "acct 0945", "card no. 0945", "...0945", "•••• 0945", "xx0945".
+  if(/\b(?:card|acct|account|ending(?:\s+in)?|last\s*(?:4|four))\b[^\n\d]{0,12}\d{4}\b|(?:[x*•]{2,}|\.{3,})\s*\d{4}\b/i.test(t))return "credit_card";
   if(/\b(payment|tender(?:ed)?|paid)\s*(?:mode)?\s*:?\s*cash\b|\bcash\s+(tendered|payment)\b|(?:^|\n)\s*cash\s*(?:rm|usd|\$)?\s*:?\s*\d/i.test(t))return "cash";
   if(/\b(payment|paid)\s*:?\s*check\b|\bcheck\s*#?\s*\d/i.test(t))return "check";
   if(/\b(payment|paid)\s*:?\s*wire\b|\bwire\s+(transfer|payment)\b/i.test(t))return "wire";

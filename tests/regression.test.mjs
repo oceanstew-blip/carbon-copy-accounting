@@ -299,6 +299,13 @@ test("strong match (same-day + vendor text match) auto-links on next transaction
   assert.equal(check.already_matched, true, "receipt should have auto-linked");
 });
 
+test("a receipt that prints only the card's last four digits is read as a card payment (and phone numbers are not)", () => {
+  for (const s of ["Card ending in 0945", "ACCT 0945", "Card No. 0945", "paid ...0945", "•••• 0945", "xx0945", "Last 4: 0945"])
+    assert.equal(detectPaymentMethodFromText(s), "credit_card", s);
+  for (const s of ["Tel (561) 208-0945", "Order No. 4521", "Invoice 2026-0945", "Cashier 0945", "Receipt #0945"])
+    assert.equal(detectPaymentMethodFromText(s), null, s);
+});
+
 test("unmatched card receipt shows as pending in Transactions, then disappears once its charge arrives; never counted as posted", async () => {
   const tag = "PendingTestMarine" + crypto.randomUUID().slice(0, 8);
   const receiptId = await insertBareReceipt({ vendor: tag, amount: 61.25, receipt_date: "2026-09-21" });
