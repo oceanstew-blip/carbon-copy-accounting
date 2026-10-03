@@ -59,6 +59,15 @@ test("server.js has valid syntax", () => {
   execSync("node --check server.js");
 });
 
+test("page files have no garbled characters (Â·, â€¦) and no hidden BOM", async () => {
+  const fs = await import("node:fs");
+  for (const f of ["public/index.html", "public/app.js", "public/style.css", "server.js"]) {
+    const s = fs.readFileSync(f, "utf8");
+    assert.notEqual(s.charCodeAt(0), 0xfeff, f + " must not start with a byte-order mark");
+    assert.ok(!/[ÂâÃ][\u0080-¿€‘-™Œ-Ÿ]/.test(s), f + " contains double-encoded (garbled) characters");
+  }
+});
+
 test("/health responds ok", async () => {
   const res = await apiFetch("/health");
   assert.equal(res.status, 200);
