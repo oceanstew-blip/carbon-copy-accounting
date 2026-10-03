@@ -997,6 +997,78 @@ test("azure document intelligence: PDF goes up as-is, fields come back, compare 
   } finally { delete process.env.AZURE_DI_ENDPOINT; delete process.env.AZURE_DI_KEY; srv.close(); }
 });
 
+test("receipt cutting rules: azure outlines become crop boxes; doubtful cases are left alone", async () => {
+  const { azureRegions, planCuts, cropRegion } = await import("../receiptsplit.js");
+  const sharp = (await import("sharp")).default;
+  const poly = (x0, y0, x1, y1) => [x0, y0, x1, y0, x1, y1, x0, y1];
+  const doc = (page, p) => ({ boundingRegions: [{ pageNumber: page, polygon: p }] });
+  const pages = [{ pageNumber: 1, width: 1000, height: 2000 }, { pageNumber: 2, width: 1000, height: 2000 }];
+  // two receipts side by side on one page
+  let reg = azureRegions({ pages, documents: [doc(1, poly(50, 100, 450, 1900)), doc(1, poly(520, 120, 950, 1850))] });
+  assert.equal(reg.length, 2);
+  assert.deepEqual([reg[0].x0, reg[0].x1, reg[1].x0], [0.05, 0.45, 0.52]);
+  assert.equal(planCuts(reg, 1, false).length, 2, "photo with two receipts is cut");
+  // one receipt, or no outline, or a receipt spanning two pages: never cut
+  assert.deepEqual(azureRegions({ pages, documents: [doc(1, poly(0, 0, 900, 1900))] }), []);
+  assert.deepEqual(azureRegions({ pages, documents: [{ boundingRegions: [] }, doc(1, poly(0, 0, 900, 1900))] }), []);
+  assert.deepEqual(azureRegions({ pages, documents: [{ boundingRegions: [{ pageNumber: 1, polygon: poly(0, 0, 400, 1900) }, { pageNumber: 2, polygon: poly(0, 0, 400, 1900) }] }, doc(2, poly(500, 0, 950, 1900))] }), []);
+  // the same receipt found twice (heavy overlap), or specks far too small: do not cut
+  assert.equal(planCuts(azureRegions({ pages, documents: [doc(1, poly(50, 100, 450, 1900)), doc(1, poly(60, 110, 440, 1890))] }), 1, false), null);
+  assert.equal(planCuts(azureRegions({ pages, documents: [doc(1, poly(50, 100, 450, 1900)), doc(1, poly(500, 100, 520, 140))] }), 1, false), null);
+  // photos stacked together as one tall image cannot be mapped back, a PDF can
+  assert.equal(planCuts(reg, 3, false), null);
+  assert.equal(planCuts(reg, 3, true).length, 2);
+  // the crop has the right size and keeps the picture sharp enough to read
+  const img = await sharp({ create: { width: 1000, height: 2000, channels: 3, background: "#ffffff" } }).jpeg().toBuffer();
+  const crop = await sharp(await cropRegion(img, reg[0])).metadata();
+  assert.ok(Math.abs(crop.width - 0.43 * 1000) < 30 && Math.abs(crop.height - 0.915 * 2000) < 60, `unexpected crop ${crop.width}x${crop.height}`);
+});
+
+test("one photo with two receipts is cut into two receipts, flagged for review, and a re-upload is a duplicate", async () => {
+  const http = await import("node:http");
+  const { readFileSync } = await import("node:fs");
+  const sharp = (await import("sharp")).default;
+  const base = readFileSync(new URL("./fixtures/ocr-self-test-receipt.png", import.meta.url));
+  // two receipt pictures placed side by side on one wide background (a different pair each run so it is never a duplicate)
+  const tag = crypto.randomUUID();
+  const side = await sharp(base).resize({ width: 500 }).png().toBuffer();
+  const sm = await sharp(side).metadata();
+  const photo = await sharp({ create: { width: 1100, height: sm.height + 40, channels: 3, background: "#d8dadc" } })
+    .composite([{ input: side, left: 30, top: 20 }, { input: side, left: 570, top: 20 }]).jpeg().toBuffer();
+  const unique = await sharp(photo).composite([{ input: { text: { text: tag.slice(0, 8), dpi: 72 } }, left: 5, top: 2 }]).jpeg().toBuffer();
+  let port;
+  const srv = http.createServer((req, res) => {
+    req.on("data", () => {}); req.on("end", () => {
+      res.setHeader("content-type", "application/json");
+      if (req.method === "POST") { res.statusCode = 202; res.setHeader("operation-location", `http://127.0.0.1:${port}/poll/1`); return res.end("{}"); }
+      const H = sm.height + 40, p = (x0, x1) => [x0, 10, x1, 10, x1, H - 10, x0, H - 10];
+      const f = (v) => ({ MerchantName: { valueString: v }, Total: { valueCurrency: { amount: 12.5 } } });
+      res.end(JSON.stringify({ status: "succeeded", analyzeResult: { pages: [{ pageNumber: 1, width: 1100, height: H }], documents: [
+        { fields: f("Left Shop"), boundingRegions: [{ pageNumber: 1, polygon: p(20, 540) }] },
+        { fields: f("Right Shop"), boundingRegions: [{ pageNumber: 1, polygon: p(560, 1080) }] }] } }));
+    });
+  });
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r)); port = srv.address().port;
+  process.env.AZURE_DI_ENDPOINT = `http://127.0.0.1:${port}`; process.env.AZURE_DI_KEY = "k";
+  try {
+    const send = async () => {
+      const f = new FormData(); f.append("mode", "auto"); f.append("files", new Blob([unique], { type: "image/jpeg" }), `two-receipts-${tag.slice(0, 6)}.jpg`);
+      const r = await fetch(BASE + "/api/receipts/inbox", { method: "POST", headers: { Authorization: AUTH }, body: f });
+      assert.equal(r.status, 200); return (await r.json()).groups[0];
+    };
+    const g = await send();
+    assert.equal(g.status, "ingested"); assert.equal(g.split, 2); assert.equal(g.newCount, 2); assert.equal(g.ids.length, 2);
+    const rows = (await pool.query("SELECT file_name, review_required, ocr_review_reasons FROM receipts WHERE id = ANY($1) ORDER BY id", [g.ids])).rows;
+    assert.equal(rows.length, 2);
+    for (const row of rows) {
+      assert.equal(row.review_required, true, "a cut receipt is never auto-confirmed");
+      assert.match(String(row.ocr_review_reasons), /auto-cut/);
+    }
+    const again = await send();
+    assert.equal(again.status, "duplicate", "uploading the same photo again must not make more receipts");
+  } finally { delete process.env.AZURE_DI_ENDPOINT; delete process.env.AZURE_DI_KEY; srv.close(); }
+});
+
 test("test-receipt cleanup: preview first, removes a manual receipt + its transaction, audited, closed months untouched", async () => {
   const { readFileSync } = await import("node:fs");
   const sharp = (await import("sharp")).default;

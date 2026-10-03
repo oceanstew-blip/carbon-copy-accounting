@@ -115,7 +115,12 @@ for ($i = 0; $i -lt $files.Count; $i += $BatchSize) {
     $res = Send-Batch $batch
     foreach ($g in $res.groups) {
       $names = $g.files -join ', '
-      if ($g.status -eq 'ingested') { $new++; Write-Host "  new:        $names" ; Log "new: $names" }
+      if ($g.status -eq 'ingested' -and $g.split) {
+        $new += [int]$g.newCount; $dup += [int]$g.duplicateCount; $failed += [int]$g.failedCount
+        Write-Host ("  CUT APART:  {0} - held {1} receipts ({2} new). Check the cuts in Needs Review." -f $names, $g.split, $g.newCount)
+        Log ("cut apart: $names into $($g.split) (new=$($g.newCount) dup=$($g.duplicateCount) failed=$($g.failedCount))")
+      }
+      elseif ($g.status -eq 'ingested') { $new++; Write-Host "  new:        $names" ; Log "new: $names" }
       elseif ($g.status -eq 'duplicate') { $dup++; Write-Host "  duplicate:  $names" ; Log "duplicate: $names" }
       else { $failed++; Write-Host "  FAILED:     $names - $($g.error)" -ForegroundColor Red; Log "FAILED: $names - $($g.error)" }
     }

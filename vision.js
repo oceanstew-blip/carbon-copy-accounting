@@ -1,6 +1,7 @@
 // Optional second reader: a vision model reads the receipt image(s) and Tesseract cross-checks it.
 // Off unless ANTHROPIC_API_KEY is set. Any failure falls back to the Tesseract result, never blocks a receipt.
 import sharp from "sharp";
+import { azureRegions } from "./receiptsplit.js";
 
 const PROMPT=`These images are the pages of ONE receipt, top to bottom, in order. Read the printed text exactly; never guess a digit.
 Return ONLY a JSON object with these keys (null when not printed or not legible):
@@ -64,6 +65,7 @@ async function azureRead(buffers,{fetchImpl=fetch,original=null}={}){
       receipt_date:/^\d{4}-\d{2}-\d{2}$/.test(d.TransactionDate?.valueDate||"")?d.TransactionDate.valueDate:null,
       amount:num(money(d.Total)),subtotal:num(money(d.Subtotal)),tax:num(money(d.TotalTax)),
       detected_payment_method:null,card_last4:null,total_page:null,multiple:docs.length>1,
+      regions:azureRegions(j.analyzeResult),
       conf:{total:d.Total?.confidence??null,vendor:d.MerchantName?.confidence??null,date:d.TransactionDate?.confidence??null}
     };
   }

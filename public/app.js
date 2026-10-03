@@ -79,7 +79,7 @@ function setupFolderUpload(){
       pick.value='';return}
     if(!confirm('Upload '+files.length+' file'+(files.length===1?'':'s')+' from this folder? Each one is read and added as a receipt. Duplicates are skipped.')){pick.value='';return}
     btn.disabled=true;
-    const tally={ingested:0,duplicate:0,failed:0},problems=[];
+    const tally={ingested:0,duplicate:0,failed:0,cutFiles:0},problems=[];
     const BATCH=15;
     for(let i=0;i<files.length;i+=BATCH){
       const batch=files.slice(i,i+BATCH);
@@ -91,14 +91,19 @@ function setupFolderUpload(){
       try{
         const res=await api('receipts/inbox',{method:'POST',body:fd});
         (res.groups||[]).forEach((g)=>{
-          if(g.status==='ingested') tally.ingested++;
-          else if(g.status==='duplicate') tally.duplicate++;
+          if(g.split) tally.cutFiles++;
+          if(g.status==='ingested'){
+            tally.ingested+=g.newCount||1;tally.duplicate+=g.duplicateCount||0;tally.failed+=g.failedCount||0;
+            if(g.failedCount) problems.push((g.files||[]).join(', ')+': '+g.failedCount+' of '+g.split+' cut receipts could not be saved');
+          }
+          else if(g.status==='duplicate') tally.duplicate+=g.duplicateCount||1;
           else{tally.failed++;problems.push((g.files||[]).join(', ')+': '+(g.error||'could not be read'))}
         });
       }catch(e){tally.failed+=batch.length;problems.push(batch.length+' files ('+batch[0].name+' ...): '+e.message)}
     }
     tooBig.forEach((f)=>problems.push(f.name+': larger than 20 MB, not uploaded'));
     let msg='Done. '+tally.ingested+' new receipt'+(tally.ingested===1?'':'s')+', '+tally.duplicate+' already in the system'+(tally.failed?', '+tally.failed+' failed':'')+'.';
+    if(tally.cutFiles) msg+=' '+tally.cutFiles+' file'+(tally.cutFiles===1?'':'s')+' held several receipts and '+(tally.cutFiles===1?'was':'were')+' cut apart automatically. Check the cuts in Needs Review.';
     if(skipped) msg+=' '+skipped+' other file'+(skipped===1?'':'s')+' (not photos or PDFs) '+(skipped===1?'was':'were')+' ignored.';
     out.innerHTML=esc(msg)+(problems.length?'<ul>'+problems.map((p)=>'<li>'+esc(p)+'</li>').join('')+'</ul>':'');
     pick.value='';btn.disabled=false;

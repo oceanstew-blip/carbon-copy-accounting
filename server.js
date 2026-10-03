@@ -4,6 +4,7 @@ import pg from "pg";
 import crypto from "crypto";
 import sharp from "sharp";
 import { withVision, visionRead, visionEnabled, visionEngine } from "./vision.js";
+import { planCuts, cropRegion } from "./receiptsplit.js";
 import { promises as fsp } from "fs";
 import { ocrRaw, interpretRaw, combineRaws, groupLoosePhotos, pdfToImages, toReadable, isHeic, getOcrWorker, isoReceiptDate, amountFromLine, detectPaymentMethodFromText, suggestedCategoryFromText, labeledAmount, parseOcrReceipt, mergeOcrFields, chooseBestAmount, ocrImage } from "./ocr.js";
 import { AwsClient } from "aws4fetch";
@@ -255,6 +256,7 @@ async function init(){
     CREATE TABLE IF NOT EXISTS receipt_pages(
       id BIGSERIAL PRIMARY KEY,receipt_id BIGINT NOT NULL REFERENCES receipts(id) ON DELETE CASCADE,page_no INT NOT NULL,
       file_name TEXT NOT NULL,file_sha256 TEXT NOT NULL,file_data BYTEA NOT NULL,raw JSONB,UNIQUE(receipt_id,page_no));
+    CREATE TABLE IF NOT EXISTS split_sources(file_sha256 TEXT PRIMARY KEY,receipts INT NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
     ALTER TABLE receipts ADD COLUMN IF NOT EXISTS match_method TEXT;
     ALTER TABLE receipts ADD COLUMN IF NOT EXISTS match_score INT;
     ALTER TABLE receipts ADD COLUMN IF NOT EXISTS matched_at TIMESTAMPTZ;
@@ -1463,14 +1465,40 @@ const sha256=(b)=>crypto.createHash("sha256").update(b).digest("hex");
 function typeOfName(name,fallback){return IMG_TYPES[String(name).toLowerCase().match(/\.[^.]+$/)?.[0]]||fallback}
 function interpretPages(raws,totalIdx){return interpretRaw(raws.length===1?raws[0]:combineRaws(raws,totalIdx))}
 
+// A photo or scanned PDF that holds several receipts was cut apart (see receiptsplit.js). Save each cut as its own
+// receipt; every one is flagged so the captain checks the cut. The original file is remembered so a re-upload is a duplicate.
+async function splitIntoReceipts(pages,cuts,{groupSha,original,extraReasons=[]}){
+  const base=String(pages[0].name).replace(/\.[^.]+$/,"").replace(/-p\d+$/,"");
+  const results=[];
+  for(const [k,c] of cuts.entries()){
+    try{
+      const buffer=await cropRegion(pages[c.page-1].buffer,c);
+      let raw=null;try{raw=await ocrRaw(buffer)}catch(e){console.error("SPLIT_OCR_FAILED",base,e.message)}
+      results.push(await saveReceiptPages([{buffer,name:`${base}-r${k+1}.jpg`,sha:sha256(buffer),raw}],{noSplit:true,
+        extraReasons:[...extraReasons,`auto-cut: receipt ${k+1} of ${cuts.length} from one ${original?"PDF":"photo"}, check the cut`]}));
+    }catch(e){console.error("SPLIT_CUT_FAILED",base,k+1,e.message);results.push({status:"error",error:e.message})}
+  }
+  const made=results.filter((r)=>r.status==="ingested"),dups=results.filter((r)=>r.status==="duplicate"),errs=results.filter((r)=>r.status==="error");
+  if((made.length||dups.length)&&!errs.length)await pool.query("INSERT INTO split_sources(file_sha256,receipts) VALUES($1,$2) ON CONFLICT DO NOTHING",[groupSha,made.length+dups.length]);
+  return{status:made.length?"ingested":(dups.length&&!errs.length)?"duplicate":"error",id:made[0]?.id,ids:made.map((r)=>r.id),
+    split:cuts.length,newCount:made.length,duplicateCount:dups.length,failedCount:errs.length,error:errs[0]?.error};
+}
+
 // pages: [{buffer,name,sha,raw}] (raw = ocrRaw result or null). Saves one receipt + its pages.
-async function saveReceiptPages(pages,{autoGrouped=false,original=null,extraReasons=[]}={}){
+async function saveReceiptPages(pages,{autoGrouped=false,original=null,extraReasons=[],noSplit=false}={}){
   const groupSha=original?sha256(original.buffer):pages.length===1?pages[0].sha:sha256(pages.map((p)=>p.sha).join(""));
   const dup=(await pool.query("SELECT id FROM receipts WHERE file_sha256=$1",[groupSha])).rows[0];
   if(dup)return{status:"duplicate",id:dup.id};
+  // A file we already cut into several receipts is a duplicate too (the cuts themselves have different hashes).
+  if((await pool.query("SELECT 1 FROM split_sources WHERE file_sha256=$1",[groupSha])).rowCount)return{status:"duplicate",id:null,split:true};
   const raws=pages.map((p)=>p.raw).filter(Boolean);
   let d={vendor:null,receipt_date:null,amount:null,suggested_category:null,detected_payment_method:null,receipt_text:null,confidence:null,field_score:null,review_reasons:[]};
   if(raws.length===pages.length)d=await withVision(interpretPages(raws),pages.map((p)=>p.buffer),{original:original?.buffer});
+  // Several receipts in one photo / one scanned PDF: cut each out and save it as its own receipt, flagged for review.
+  if(!noSplit){
+    const cuts=planCuts(d.vision?.regions,pages.length,Boolean(original));
+    if(cuts)return splitIntoReceipts(pages,cuts,{groupSha,original,extraReasons});
+  }
   const reasons=[...(d.review_reasons||[])];
   if(pages.length>1)reasons.push(original?"multi-page PDF":autoGrouped?"photos grouped automatically":"multi-photo receipt");
   reasons.push(...extraReasons);
@@ -1591,7 +1619,7 @@ app.post("/api/receipts/:id/split",async(req,res,next)=>{try{
   if(!a.length||!b.length)return res.status(400).json({error:"Split must leave at least one photo on each side"});
   const toPages=(arr)=>arr.map((p)=>({buffer:p.buffer,name:p.file_name,sha:p.sha,raw:p.raw}));
   await pool.query("DELETE FROM receipts WHERE id=$1",[id]);
-  const out=[];for(const part of [a,b])out.push(await saveReceiptPages(toPages(part),{autoGrouped:true}));
+  const out=[];for(const part of [a,b])out.push(await saveReceiptPages(toPages(part),{autoGrouped:true,noSplit:true}));
   await audit("captain","split","receipt",id,{pages:pg.length},{new_ids:out.map((x)=>x.id)},{source:"POST /api/receipts/:id/split"});
   res.json({receipts:out});
 }catch(e){next(e)}});
