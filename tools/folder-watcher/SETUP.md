@@ -39,3 +39,13 @@ Nothing is posted to the books until you review it.
 1. Wait two minutes, then open `watcher.log` (next to the script) and read the last few lines.
 2. "Cannot reach" means the computer has no internet or the app address is wrong. Run setup again with -Setup.
 3. A file still sitting in the folder after a few minutes was not uploaded. Anything the app could not read stays there on purpose.
+
+## Upload a whole folder at once
+Besides the watched folder, you can point the app at any folder on the computer.
+1. Put `Upload-Folder.ps1` and `Upload Folder.bat` in the same folder as `config.json` (the watcher folder).
+2. Double-click `Upload Folder.bat`, pick the folder, and answer `y`. Every photo and PDF inside it, including subfolders, goes to the app as its own receipt.
+3. The app reads each one and skips duplicates. Nothing on the computer is moved or deleted. A subfolder called `Done` is skipped.
+- To list what would be uploaded without uploading: `powershell -File Upload-Folder.ps1 -Path "C:\Receipts\August" -DryRun`
+- Results are also written to `Upload-Folder.log`.
+- It uses the same app address and login as the watcher. If it says the login is wrong (401), run the watcher setup again.
+- A PDF or photo that holds several receipts is still read as ONE receipt. Split it first (see "What the flags mean").
