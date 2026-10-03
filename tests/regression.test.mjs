@@ -90,6 +90,24 @@ test("re-running init() (what every startup does) does not change transaction co
   assert.equal(after.rows.length, before.rows.length, "repeated init() must not create/remove transactions");
 });
 
+test("latest-month returns the newest month with a posted transaction", async () => {
+  const empty = await (await apiFetch("/api/latest-month")).json();
+  assert.ok(empty.month === null || /^\d{4}-\d{2}$/.test(empty.month), "month is null or YYYY-MM");
+  const res = await apiFetch("/api/transactions", {
+    method: "POST",
+    body: JSON.stringify({
+      transaction_date: "2026-08-15", vendor_raw: "Latest Month Probe", amount: 12,
+      payment_method: "cash", external_id: "test-latest-" + crypto.randomUUID(),
+    }),
+  });
+  assert.equal(res.status, 201);
+  const body = await (await apiFetch("/api/latest-month")).json();
+  assert.match(body.month, /^\d{4}-\d{2}$/);
+  assert.ok(body.month >= "2026-08", "must be at least the month just posted");
+  const list = await (await apiFetch("/api/transactions?month=" + body.month)).json();
+  assert.ok(list.rows.some((r) => r.status === "posted"), "that month must contain a posted transaction");
+});
+
 // ---- Cash / Check / Wire ----
 
 test("cash receipt transaction posts immediately, never pending", async () => {

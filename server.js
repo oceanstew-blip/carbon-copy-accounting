@@ -524,6 +524,12 @@ app.get("/api/dashboard",async(req,res,next)=>{try{
   res.json({month,summary:{...s.rows[0],unmatched_receipts:ri.rows[0].count},byCategory:bc.rows,byVendor:bv.rows})
 }catch(e){next(e)}});
 
+// The newest month that has any posted transaction, so the dashboard can open on real data instead of an empty current month.
+app.get("/api/latest-month",async(_req,res,next)=>{try{
+  const q=await pool.query("SELECT to_char(MAX(transaction_date),'YYYY-MM') AS month FROM transactions WHERE status='posted'");
+  res.json({month:q.rows[0].month||null})
+}catch(e){next(e)}});
+
 app.get("/api/transactions",async(req,res,next)=>{try{
   const {start,next:n}=monthBounds(req.query.month);
   const q=await pool.query(`SELECT t.id,t.transaction_date,t.posted_date,t.vendor_raw,t.vendor_normalized,t.amount,t.notes,t.status,t.captain_reviewed,

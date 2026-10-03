@@ -777,11 +777,24 @@ function wireStaticControls(){
   });
 }
 
+// If the current month has nothing posted yet, open on the newest month that does, so the dashboard is not a wall of zeros.
+async function openOnLatestMonthWithData(){
+  const monthEl=$('#month');
+  if(!monthEl) return;
+  try{
+    const d=await api('dashboard?month='+encodeURIComponent(monthEl.value));
+    if((d.summary&&d.summary.transactions)>0) return;
+    const l=await api('latest-month');
+    if(l&&l.month) monthEl.value=l.month;
+  }catch(e){console.error(e)}
+}
+
 async function boot(){
   wireNavigation();
   wireStaticControls();
   try{
     await loadBootstrap();
+    await openOnLatestMonthWithData();
     await Promise.all([loadDashboard(),loadTransactions(),loadReceiptInbox()]);
   }catch(e){
     console.error(e);
