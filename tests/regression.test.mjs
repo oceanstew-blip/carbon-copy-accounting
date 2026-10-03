@@ -700,7 +700,7 @@ test("/login page renders without auth", async () => {
   assert.equal(res.status, 200);
   const html = await res.text();
   assert.match(html, /Sign in/);
-  assert.match(html, /M\/Y CARBON COPY/);
+  assert.match(html, /M\/Y QUIXOTIC/);
 });
 
 test("wrong password on /login shows an error, no cookie set", async () => {

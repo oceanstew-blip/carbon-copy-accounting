@@ -8,7 +8,7 @@ web
 
 ## Users
 
-Solo user: the captain of M/Y Carbon Copy, a privately owned U.S.-flagged motor yacht (not a charter vessel). The captain is the only person who opens the app day to day. The owner and the shore-side accountant receive output from it (CSV exports, exception reports) but do not log in themselves. Design for one operator working through routine bookkeeping, not for multiple roles or a team.
+Solo user: the captain of M/Y Quixotic, a privately owned U.S.-flagged motor yacht (not a charter vessel). The captain is the only person who opens the app day to day. The owner and the shore-side accountant receive output from it (CSV exports, exception reports) but do not log in themselves. Design for one operator working through routine bookkeeping, not for multiple roles or a team.
 
 ## Product Purpose
 
@@ -32,7 +32,7 @@ Routine cycle: photograph/upload a receipt → OCR reads what it can → captain
 
 ## Brand Commitments
 
-Boat name "M/Y Carbon Copy" and the app name "Carbon Copy Accounting" are fixed. No logo, photography, or other brand assets exist yet — captain confirmed text/data-only for now, nothing to source or wait on.
+Boat name "M/Y Quixotic" and the app name "Carbon Copy Accounting" are fixed. No logo, photography, or other brand assets exist yet — captain confirmed text/data-only for now, nothing to source or wait on.
 
 ## Evidence on Hand
 
