@@ -66,3 +66,83 @@ export async function cropRegion(buffer, r, pad = 0.015) {
   const right = Math.min(W, Math.ceil((r.x1 + pad) * W)), bottom = Math.min(H, Math.ceil((r.y1 + pad) * H));
   return img.extract({ left, top, width: Math.max(1, right - left), height: Math.max(1, bottom - top) }).jpeg({ quality: 90 }).toBuffer();
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// Fallback: find receipts lying side by side by the empty vertical gaps between their text.
+// Azure often reads a taped-together row of receipts as ONE receipt, so we also look at the picture ourselves.
+// A "black-hat" filter keeps thin dark marks (text, handwriting) and ignores paper edges and shadows. A column that
+// has no text anywhere from top to bottom is a gap; text that crosses a gap (a centred header, a total line) means
+// it is not a gap between two receipts. Only photos/scans are examined; a clean white digital page never is.
+const GW = 640; // working width
+
+function minMax(src, w, h, k, useMax) {
+  const r = k >> 1, tmp = new Uint8Array(w * h), out = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    let v = useMax ? 0 : 255;
+    for (let i = Math.max(0, x - r); i <= Math.min(w - 1, x + r); i++) { const s = src[y * w + i]; if (useMax ? s > v : s < v) v = s; }
+    tmp[y * w + x] = v;
+  }
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    let v = useMax ? 0 : 255;
+    for (let j = Math.max(0, y - r); j <= Math.min(h - 1, y + r); j++) { const s = tmp[j * w + x]; if (useMax ? s > v : s < v) v = s; }
+    out[y * w + x] = v;
+  }
+  return out;
+}
+
+/** @returns {Promise<{regions:{page:number,x0:number,y0:number,x1:number,y1:number}[], debug:object}>} normalized boxes, or [] */
+export async function detectSideBySide(buffer, opts = {}) {
+  const minGapFrac = opts.minGapFrac ?? 0.007, minWidthFrac = opts.minWidthFrac ?? 0.1;
+  const { data, info } = await sharp(buffer, { failOn: "none" }).rotate().resize({ width: GW }).greyscale().raw().toBuffer({ resolveWithObject: true });
+  const w = info.width, h = info.height;
+  let bright = 0; for (let i = 0; i < data.length; i++) if (data[i] >= 253) bright++;
+  const brightFrac = bright / data.length;
+  if (brightFrac > 0.4 || h < w * 0.5) return { regions: [], debug: { brightFrac, reason: "digital or too wide" } };
+
+  const closed = minMax(minMax(data, w, h, 9, true), w, h, 9, false); // closing = erode(dilate)
+  const col = new Float32Array(w), ink = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const i = y * w + x;
+    if (closed[i] - data[i] > 22) { ink[i] = 1; col[x]++; }
+  }
+  const edge = Math.round(w * 0.012);
+  const occupied = new Uint8Array(w);
+  const need = Math.max(5, Math.round(h * 0.012));
+  for (let x = 0; x < w; x++) {
+    let s = 0; for (let k = -1; k <= 1; k++) { const xx = x + k; if (xx >= 0 && xx < w) s += col[xx]; }
+    occupied[x] = x >= edge && x < w - edge && s / 3 >= need ? 1 : 0;
+  }
+  // A thin occupied stripe (under 4 px) is a paper edge or a shadow line, not text: treat it as empty.
+  for (let x = 0; x < w;) {
+    if (!occupied[x]) { x++; continue; }
+    let e = x; while (e < w && occupied[e]) e++;
+    if (e - x < 4) for (let k = x; k < e; k++) occupied[k] = 0;
+    x = e;
+  }
+  // blocks of occupied columns separated by gaps of at least minGapFrac of the width
+  const minGap = Math.max(3, Math.round(w * minGapFrac));
+  const segs = [];
+  let start = -1, last = -1;
+  for (let x = 0; x < w; x++) {
+    if (occupied[x]) { if (start < 0) start = x; last = x; }
+    else if (start >= 0 && x - last >= minGap) { segs.push([start, last]); start = -1; }
+  }
+  if (start >= 0) segs.push([start, last]);
+  const totalInk = col.reduce((p, q) => p + q, 0);
+  const massOf = ([a, b]) => { let m = 0; for (let x = a; x <= b; x++) m += col[x]; return m; };
+  // each receipt must be wide enough and hold a fair share of all the text (drops stray slivers)
+  const kept = segs.filter((sg) => (sg[1] - sg[0] + 1) >= w * minWidthFrac && massOf(sg) >= totalInk * 0.08);
+  const debug = { col: opts.debug ? Array.from(col) : undefined, brightFrac: +brightFrac.toFixed(3), segs: segs.map(([a, b]) => `${Math.round(a / w * 100)}-${Math.round(b / w * 100)}%`) };
+  if (kept.length < 2) return { regions: [], debug };
+
+  const regions = kept.map(([x0, x1], i) => {
+    let y0 = h, y1 = 0;
+    const rowNeed = Math.max(2, Math.round((x1 - x0 + 1) * 0.004));
+    for (let y = 0; y < h; y++) { let c = 0; for (let x = x0; x <= x1; x++) c += ink[y * w + x]; if (c >= rowNeed) { if (y < y0) y0 = y; if (y > y1) y1 = y; } }
+    const prev = i > 0 ? kept[i - 1][1] : 0, next = i < kept.length - 1 ? kept[i + 1][0] : w;
+    const padX = Math.min(w * 0.03, (x0 - prev) / 2, (next - x1) / 2);
+    const padY = h * 0.025;
+    return { page: 1, x0: Math.max(0, (x0 - padX) / w), x1: Math.min(1, (x1 + padX) / w), y0: Math.max(0, (y0 - padY) / h), y1: Math.min(1, (y1 + padY) / h) };
+  }).filter((r) => r.y1 - r.y0 > 0.2);
+  return { regions: regions.length >= 2 ? regions : [], debug };
+}

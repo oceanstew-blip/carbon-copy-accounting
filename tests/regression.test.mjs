@@ -1069,6 +1069,46 @@ test("one photo with two receipts is cut into two receipts, flagged for review, 
   } finally { delete process.env.AZURE_DI_ENDPOINT; delete process.env.AZURE_DI_KEY; srv.close(); }
 });
 
+// A tall strip of "paper" with lines of text, like a till receipt photographed on a table.
+function fakeReceiptSvg(seed) {
+  const lines = Array.from({ length: 24 }, (_, i) => `<text x="28" y="${56 + i * 30}" font-family="monospace" font-size="19" fill="#222">ITEM ${seed}${i} ....... ${(i * 3.7 + 1).toFixed(2)}</text>`).join("");
+  return Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="420" height="800"><rect width="420" height="800" fill="#e4e4e2"/>${lines}</svg>`);
+}
+
+test("two receipts side by side in one photo are found from the picture alone, cut apart, and the original is kept in the Trash", async () => {
+  const { readFileSync } = await import("node:fs");
+  const sharp = (await import("sharp")).default;
+  const tag = crypto.randomUUID().slice(0, 8);
+  const left = await sharp(fakeReceiptSvg("A")).png().toBuffer(), right = await sharp(fakeReceiptSvg("B")).png().toBuffer();
+  // two receipts on a grey table with a clear gap between them, plus a unique mark so every run is a new file
+  const photo = await sharp({ create: { width: 1000, height: 860, channels: 3, background: "#cfd3d6" } })
+    .composite([{ input: left, left: 60, top: 30 }, { input: right, left: 540, top: 30 },
+      { input: { text: { text: `<span foreground="#444444">${tag}</span>`, rgba: true, dpi: 60 } }, left: 8, top: 4 }]).jpeg().toBuffer();
+  const send = async () => {
+    const f = new FormData(); f.append("mode", "auto"); f.append("files", new Blob([photo], { type: "image/jpeg" }), `side-by-side-${tag}.jpg`);
+    const r = await fetch(BASE + "/api/receipts/inbox", { method: "POST", headers: { Authorization: AUTH }, body: f });
+    assert.equal(r.status, 200); return (await r.json()).groups[0];
+  };
+  const g = await send();
+  assert.equal(g.status, "ingested"); assert.equal(g.split, 2, "two receipts found"); assert.equal(g.newCount, 2);
+  const kept = (await pool.query("SELECT receipt->>'file_name' AS file_name FROM receipts_trash WHERE receipt->>'file_name' LIKE $1", [`ORIGINAL%${tag}%`])).rows;
+  assert.equal(kept.length, 1, "the original photo must be kept in the Trash");
+  assert.equal((await send()).status, "duplicate", "uploading the same photo again must not make more receipts");
+});
+
+test("a single receipt photo is not cut", async () => {
+  const { readFileSync } = await import("node:fs");
+  const sharp = (await import("sharp")).default;
+  const tag = crypto.randomUUID().slice(0, 8);
+  const one = await sharp(fakeReceiptSvg("C")).png().toBuffer();
+  const photo = await sharp({ create: { width: 560, height: 860, channels: 3, background: "#cfd3d6" } })
+    .composite([{ input: one, left: 70, top: 30 }, { input: { text: { text: `<span foreground="#444444">${tag}</span>`, rgba: true, dpi: 60 } }, left: 8, top: 4 }]).jpeg().toBuffer();
+  const f = new FormData(); f.append("mode", "auto"); f.append("files", new Blob([photo], { type: "image/jpeg" }), `one-receipt-${tag}.jpg`);
+  const r = await fetch(BASE + "/api/receipts/inbox", { method: "POST", headers: { Authorization: AUTH }, body: f });
+  const g = (await r.json()).groups[0];
+  assert.equal(g.status, "ingested"); assert.ok(!g.split, "one receipt must stay one receipt");
+});
+
 test("test-receipt cleanup: preview first, removes a manual receipt + its transaction, audited, closed months untouched", async () => {
   const { readFileSync } = await import("node:fs");
   const sharp = (await import("sharp")).default;

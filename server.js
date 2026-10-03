@@ -4,7 +4,7 @@ import pg from "pg";
 import crypto from "crypto";
 import sharp from "sharp";
 import { withVision, visionRead, visionEnabled, visionEngine } from "./vision.js";
-import { planCuts, cropRegion } from "./receiptsplit.js";
+import { planCuts, cropRegion, detectSideBySide } from "./receiptsplit.js";
 import { promises as fsp } from "fs";
 import { ocrRaw, interpretRaw, combineRaws, groupLoosePhotos, pdfToImages, toReadable, isHeic, getOcrWorker, isoReceiptDate, amountFromLine, detectPaymentMethodFromText, suggestedCategoryFromText, labeledAmount, parseOcrReceipt, mergeOcrFields, chooseBestAmount, ocrImage } from "./ocr.js";
 import { AwsClient } from "aws4fetch";
@@ -1467,6 +1467,38 @@ function interpretPages(raws,totalIdx){return interpretRaw(raws.length===1?raws[
 
 // A photo or scanned PDF that holds several receipts was cut apart (see receiptsplit.js). Save each cut as its own
 // receipt; every one is flagged so the captain checks the cut. The original file is remembered so a re-upload is a duplicate.
+// Azure often reads receipts taped side by side as ONE receipt, so look at the picture itself for the empty gaps between
+// them. A single photo, or a scanned PDF (each page checked): if any page shows 2+ receipts, every page becomes receipts
+// (a page with one receipt is kept whole). Photos the captain deliberately grouped (several files = one receipt) are never cut.
+async function findCutsByPicture(pages,isPdf){
+  if(!isPdf&&pages.length!==1)return null;
+  const perPage=[];let any=false;
+  for(const [i,p] of pages.entries()){
+    let regions=[];
+    try{regions=(await detectSideBySide(p.buffer)).regions}catch(e){console.error("SPLIT_DETECT_FAILED",e.message)}
+    if(regions.length>=2)any=true;
+    perPage.push(regions.map((r)=>({...r,page:i+1})));
+  }
+  if(!any)return null;
+  const cuts=[];
+  perPage.forEach((r,i)=>cuts.push(...(r.length?r:[{page:i+1,x0:0,y0:0,x1:1,y1:1}])));
+  return cuts;
+}
+
+// Keep the original file in the Trash (recoverable, searchable) so a wrong cut never loses the picture.
+async function archiveOriginalToTrash(pages,original,groupSha,count){
+  const buf=original?original.buffer:pages[0].buffer,mime=original?original.mime:typeOfName(pages[0].name,"image/jpeg");
+  const name=`ORIGINAL (cut into ${count} receipts) - ${original?original.name:pages[0].name}`;
+  const client=await pool.connect();
+  try{
+    await client.query("BEGIN");
+    const id=(await client.query("INSERT INTO receipts(file_name,content_type,file_size,file_data,file_sha256,review_required,expires_at) VALUES($1,$2,$3,$4,$5,true,NOW()+INTERVAL '60 days') RETURNING id",[name,mime,buf.length,buf,groupSha])).rows[0].id;
+    await snapshotToTrash(client,id);
+    await client.query("DELETE FROM receipts WHERE id=$1",[id]);
+    await client.query("COMMIT");
+  }catch(e){await client.query("ROLLBACK");console.error("SPLIT_ARCHIVE_FAILED",e.message)}finally{client.release()}
+}
+
 async function splitIntoReceipts(pages,cuts,{groupSha,original,extraReasons=[]}){
   const base=String(pages[0].name).replace(/\.[^.]+$/,"").replace(/-p\d+$/,"");
   const results=[];
@@ -1480,6 +1512,7 @@ async function splitIntoReceipts(pages,cuts,{groupSha,original,extraReasons=[]})
   }
   const made=results.filter((r)=>r.status==="ingested"),dups=results.filter((r)=>r.status==="duplicate"),errs=results.filter((r)=>r.status==="error");
   if((made.length||dups.length)&&!errs.length)await pool.query("INSERT INTO split_sources(file_sha256,receipts) VALUES($1,$2) ON CONFLICT DO NOTHING",[groupSha,made.length+dups.length]);
+  if(made.length)await archiveOriginalToTrash(pages,original,groupSha,cuts.length);
   return{status:made.length?"ingested":(dups.length&&!errs.length)?"duplicate":"error",id:made[0]?.id,ids:made.map((r)=>r.id),
     split:cuts.length,newCount:made.length,duplicateCount:dups.length,failedCount:errs.length,error:errs[0]?.error};
 }
@@ -1496,7 +1529,7 @@ async function saveReceiptPages(pages,{autoGrouped=false,original=null,extraReas
   if(raws.length===pages.length)d=await withVision(interpretPages(raws),pages.map((p)=>p.buffer),{original:original?.buffer});
   // Several receipts in one photo / one scanned PDF: cut each out and save it as its own receipt, flagged for review.
   if(!noSplit){
-    const cuts=planCuts(d.vision?.regions,pages.length,Boolean(original));
+    const cuts=planCuts(d.vision?.regions,pages.length,Boolean(original))||await findCutsByPicture(pages,Boolean(original));
     if(cuts)return splitIntoReceipts(pages,cuts,{groupSha,original,extraReasons});
   }
   const reasons=[...(d.review_reasons||[])];
