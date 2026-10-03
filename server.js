@@ -295,6 +295,11 @@ async function init(){
     ALTER TABLE transactions ADD COLUMN IF NOT EXISTS approval_note TEXT;
     ALTER TABLE transactions ADD COLUMN IF NOT EXISTS approved_by TEXT;
   `);
+  // Trash can for receipts: a deleted receipt (row, file and pages) is kept here as JSON until someone restores it.
+  // Guarded so that a problem here can never stop the app from starting.
+  try{await pool.query(`CREATE TABLE IF NOT EXISTS receipts_trash(
+    id BIGINT PRIMARY KEY,deleted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),receipt JSONB NOT NULL,pages JSONB NOT NULL DEFAULT '[]'::jsonb)`)}
+  catch(e){console.error("TRASH_TABLE_FAILED",e.message)}
   await pool.query("INSERT INTO cards(label,last4) VALUES($1,$2) ON CONFLICT(last4) DO NOTHING",[V.cardLabel,V.cardLast4]);
   const cats=["Fuel & Lubricants","Dockage / Marina","Repairs & Maintenance","Provisions","Supplies","Insurance","Communications / Internet","Crew Travel","Crew Meals","Training / Certifications","Safety Equipment","Tender / Toys","Professional Services","Shipping / Freight","Customs / Port Fees","Guest Expenses","Transportation","Capital Improvements","Owner / Personal","Navigation / Weather","Miscellaneous"];
   for(let i=0;i<cats.length;i++)await pool.query("INSERT INTO categories(name,sort_order) VALUES($1,$2) ON CONFLICT(name) DO NOTHING",[cats[i],(i+1)*10]);
@@ -943,6 +948,7 @@ app.post("/api/receipts/clear-tests",async(req,res,next)=>{try{
       if(p.action==="remove_both")tx=(await client.query("DELETE FROM transactions WHERE id=$1 AND source IN('manual','receipt-auto-repair') RETURNING *",[p.transaction_id])).rows[0]||null;
       const twinRows=[];
       for(const tw of p.twins||[])twinRows.push(...(await client.query("DELETE FROM transactions WHERE id=$1 AND source='manual' RETURNING *",[tw])).rows);
+      await snapshotToTrash(client,p.id); // recoverable from the trash (the receipt only; its removed transaction is in the audit log)
       await client.query("DELETE FROM receipts WHERE id=$1",[p.id]);
       await client.query("COMMIT");
       await audit("captain","removed_test_data","receipt",String(p.id),{receipt:rec,transaction:tx,duplicate_copies:twinRows},null,{reason:"Marked as a test/sample receipt",source:"POST /api/receipts/clear-tests"});
@@ -950,6 +956,59 @@ app.post("/api/receipts/clear-tests",async(req,res,next)=>{try{
     }catch(e){await client.query("ROLLBACK");throw e}finally{client.release()}
   }
   res.json({removed,skipped:plan.filter((p)=>p.action==="blocked"||p.action==="missing").map((p)=>p.id)});
+}catch(e){next(e)}});
+
+// ---- Receipt trash can ----
+async function snapshotToTrash(client,id){
+  await client.query(`INSERT INTO receipts_trash(id,receipt,pages)
+    SELECT r.id,to_jsonb(r),COALESCE((SELECT jsonb_agg(to_jsonb(p) ORDER BY p.page_no) FROM receipt_pages p WHERE p.receipt_id=r.id),'[]'::jsonb)
+    FROM receipts r WHERE r.id=$1
+    ON CONFLICT(id) DO UPDATE SET receipt=EXCLUDED.receipt,pages=EXCLUDED.pages,deleted_at=NOW()`,[id]);
+}
+// Only unmatched receipts can be trashed; one attached to a transaction would leave that transaction without its support.
+app.post("/api/receipts/:id/trash",async(req,res,next)=>{try{
+  const id=Number(req.params.id);if(!Number.isFinite(id))return res.status(400).json({error:"Invalid receipt id"});
+  const r=(await pool.query("SELECT id,file_name,vendor,amount,receipt_date,transaction_id FROM receipts WHERE id=$1",[id])).rows[0];
+  if(!r)return res.status(404).json({error:"Receipt not found"});
+  if(r.transaction_id)return res.status(409).json({error:"This receipt is matched to a transaction, so it can't be moved to the trash."});
+  const client=await pool.connect();
+  try{await client.query("BEGIN");await snapshotToTrash(client,id);await client.query("DELETE FROM receipts WHERE id=$1 AND transaction_id IS NULL",[id]);await client.query("COMMIT")}
+  catch(e){await client.query("ROLLBACK");throw e}finally{client.release()}
+  await audit("captain","trash","receipt",id,{file_name:r.file_name,vendor:r.vendor,amount:r.amount,receipt_date:r.receipt_date},null,{source:"POST /api/receipts/:id/trash"});
+  res.json({ok:true,trashed:id})
+}catch(e){next(e)}});
+app.get("/api/receipts-trash",async(_req,res,next)=>{try{
+  const q=await pool.query(`SELECT id,deleted_at,receipt->>'file_name' file_name,receipt->>'vendor' vendor,receipt->>'amount' amount,receipt->>'receipt_date' receipt_date,receipt->>'payment_method' payment_method
+    FROM receipts_trash ORDER BY deleted_at DESC,id DESC`);
+  res.json({rows:q.rows})
+}catch(e){next(e)}});
+app.get("/api/receipts-trash/:id/file",async(req,res,next)=>{try{
+  const r=(await pool.query("SELECT receipt->>'content_type' ct,receipt->>'file_data' fd FROM receipts_trash WHERE id=$1",[Number(req.params.id)])).rows[0];
+  if(!r||!r.fd)return res.sendStatus(404);
+  res.type(r.ct||"application/octet-stream");res.send(Buffer.from(r.fd.replace(/^\\x/,""),"hex"));
+}catch(e){next(e)}});
+app.post("/api/receipts-trash/:id/restore",async(req,res,next)=>{try{
+  const id=Number(req.params.id);if(!Number.isFinite(id))return res.status(400).json({error:"Invalid receipt id"});
+  const client=await pool.connect();let missing=false;
+  try{
+    await client.query("BEGIN");
+    const t=(await client.query("SELECT id FROM receipts_trash WHERE id=$1 FOR UPDATE",[id])).rows[0];
+    if(!t)missing=true;
+    else{
+      // The old transaction link is cleared: the transaction it pointed to may be gone, and matching runs again from scratch.
+      await client.query(`INSERT INTO receipts SELECT (jsonb_populate_record(NULL::receipts,receipt||'{"transaction_id":null}'::jsonb)).* FROM receipts_trash WHERE id=$1`,[id]);
+      await client.query("INSERT INTO receipt_pages SELECT (jsonb_populate_recordset(NULL::receipt_pages,pages)).* FROM receipts_trash WHERE id=$1",[id]);
+      await client.query("DELETE FROM receipts_trash WHERE id=$1",[id]);
+    }
+    await client.query(missing?"ROLLBACK":"COMMIT");
+  }catch(e){
+    await client.query("ROLLBACK");
+    if(e.code==="23505")return res.status(409).json({error:"The same file is already in the app, so this receipt can't be restored."});
+    throw e;
+  }finally{client.release()}
+  if(missing)return res.status(404).json({error:"Not in the trash"});
+  await audit("captain","restore","receipt",id,null,null,{source:"POST /api/receipts-trash/:id/restore"});
+  res.json({ok:true,restored:id})
 }catch(e){next(e)}});
 
 app.patch("/api/receipts/:id",async(req,res,next)=>{try{

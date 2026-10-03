@@ -153,6 +153,29 @@ function bindTransactionControls(){
   }));
 }
 
+let trashRows=[];
+async function loadTrash(){
+  const box=$('#receiptTrash'); if(!box) return;
+  trashRows=(await api('receipts-trash')).rows||[];
+  renderTrash();
+}
+function renderTrash(){
+  const box=$('#receiptTrash'); if(!box) return;
+  const q=(($('#trashSearch')&&$('#trashSearch').value)||'').trim().toLowerCase();
+  const rows=trashRows.filter((r)=>!q||[r.id,r.vendor,r.file_name,r.amount,r.receipt_date].join(' ').toLowerCase().includes(q));
+  box.innerHTML=rows.length?rows.map((r)=>
+    '<div class="receipt-item"><b>'+esc(r.vendor||r.file_name||'Receipt')+'</b>'+
+    '<div class="muted">'+esc(String(r.receipt_date||'No date').slice(0,10))+' · '+(r.amount==null?'No amount':money(r.amount))+' · deleted '+esc(String(r.deleted_at||'').slice(0,10))+'</div>'+
+    '<div class="row"><a class="receipt-link" target="_blank" href="/api/receipts-trash/'+r.id+'/file">View file</a> '+
+    '<button class="restore-receipt" data-id="'+r.id+'" type="button">Restore</button></div></div>').join('')
+    :'<p class="muted">'+(trashRows.length?'No trashed receipts match your search.':'The Trash is empty.')+'</p>';
+  $$('.restore-receipt').forEach((btn)=>btn.addEventListener('click',async()=>{
+    try{await api('receipts-trash/'+btn.dataset.id+'/restore',{method:'POST'});toast('Receipt restored');}
+    catch(e){alert(e.message||'Could not restore');return;}
+    await Promise.all([loadReceiptInbox(),loadTransactions(),loadDashboard()]);
+  }));
+}
+
 async function loadReceiptInbox(){
   const d=await api('receipt-inbox');
   receiptInbox=d.rows||[];
@@ -174,6 +197,7 @@ async function loadReceiptInbox(){
       '<button class="receipt-thumb" data-id="'+r.id+'" type="button"><img src="/api/receipts/'+r.id+'" alt="Receipt '+r.id+' preview"></button>'+
       '<div class="row"><button class="show-receipt" data-id="'+r.id+'" type="button">View Here</button></div>'+
       '<div class="row"><button class="edit-receipt" data-id="'+r.id+'" type="button">Review / Fix</button></div>'+
+      '<div class="row"><button class="trash-receipt" data-id="'+r.id+'" type="button">Move to Trash</button></div>'+
       '</div>';
   };
 
@@ -181,6 +205,17 @@ async function loadReceiptInbox(){
   const reviewRows=receiptInbox.filter((r)=>r.bucket!=='waiting');
   waiting.innerHTML=waitingRows.length?waitingRows.map((r)=>renderItem(r,false)).join(''):'<p class="muted">No credit-card receipts waiting to match.</p>';
   review.innerHTML=reviewRows.length?reviewRows.map((r)=>renderItem(r,true)).join(''):'<p class="muted">Nothing needs review.</p>';
+
+  $$('.trash-receipt').forEach((btn)=>btn.addEventListener('click',async()=>{
+    const r=receiptInbox.find((x)=>String(x.id)===String(btn.dataset.id));
+    if(!confirm('Move "'+((r&&(r.vendor||r.file_name))||'this receipt')+'" to the Trash? You can restore it from the Trash list below.'))return;
+    try{
+      await api('receipts/'+btn.dataset.id+'/trash',{method:'POST'});
+      toast('Moved to Trash');
+    }catch(e){alert(e.message||'Could not move to the Trash');return;}
+    await Promise.all([loadReceiptInbox(),loadTransactions(),loadDashboard()]);
+  }));
+  loadTrash().catch(console.error);
 
   const showReceiptInline=(id)=>{
     renderExistingReceiptPreview(id);

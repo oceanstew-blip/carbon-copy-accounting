@@ -300,6 +300,35 @@ test("strong match (same-day + vendor text match) auto-links on next transaction
   assert.equal(check.already_matched, true, "receipt should have auto-linked");
 });
 
+test("trash can: an unmatched receipt moves to the trash, leaves every list, restores intact; matched receipts are protected", async () => {
+  const tag = "TrashTest" + crypto.randomUUID().slice(0, 8);
+  const id = await insertBareReceipt({ vendor: tag, amount: 33.1, receipt_date: "2026-09-12" });
+  let res = await apiFetch(`/api/receipts/${id}/trash`, { method: "POST" });
+  assert.equal(res.status, 200, await res.clone().text());
+  let inbox = await (await apiFetch("/api/receipt-inbox")).json();
+  assert.ok(!inbox.rows.some((r) => r.id === id), "trashed receipt must leave the inbox");
+  let list = await (await apiFetch("/api/transactions?month=2026-09")).json();
+  assert.ok(!list.pending.some((p) => p.receipt_id === id), "trashed receipt must leave the pending rows");
+  let trash = await (await apiFetch("/api/receipts-trash")).json();
+  assert.ok(trash.rows.some((r) => Number(r.id) === id && r.vendor === tag), "receipt should be listed in the trash");
+  res = await apiFetch(`/api/receipts-trash/${id}/restore`, { method: "POST" });
+  assert.equal(res.status, 200, await res.clone().text());
+  inbox = await (await apiFetch("/api/receipt-inbox")).json();
+  const back = inbox.rows.find((r) => r.id === id);
+  assert.ok(back, "restored receipt should be back in the inbox");
+  assert.equal(back.vendor, tag);
+  assert.equal(Number(back.amount), 33.1);
+  trash = await (await apiFetch("/api/receipts-trash")).json();
+  assert.ok(!trash.rows.some((r) => Number(r.id) === id), "restored receipt must leave the trash");
+  // A receipt attached to a transaction cannot be trashed.
+  const free = (await pool.query("SELECT t.id FROM transactions t WHERE NOT EXISTS(SELECT 1 FROM receipts r WHERE r.transaction_id=t.id) LIMIT 1")).rows[0];
+  assert.ok(free, "need a transaction without a receipt for this check");
+  const matchedId = await insertBareReceipt({ vendor: tag + "m", amount: 1, receipt_date: "2026-09-12" });
+  await pool.query("UPDATE receipts SET transaction_id=$1 WHERE id=$2", [free.id, matchedId]);
+  res = await apiFetch(`/api/receipts/${matchedId}/trash`, { method: "POST" });
+  assert.equal(res.status, 409);
+});
+
 test("vendor names from the reader are tidied to one clean line", () => {
   assert.equal(tidyVendor("THE\nHOME\nDEPOT\n@"), "THE HOME DEPOT");
   assert.equal(tidyVendor("  Signs, Engraving & More!!  "), "Signs, Engraving & More!!");
