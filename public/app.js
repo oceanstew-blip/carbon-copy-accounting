@@ -58,6 +58,48 @@ async function renderDriveBackup(){
   box.hidden=false;
 }
 
+function setupFolderUpload(){
+  const pick=$('#folderPick'),btn=$('#folderUploadBtn'),out=$('#folderUploadStatus');
+  if(!pick||!btn) return;
+  btn.addEventListener('click',()=>pick.click());
+  pick.addEventListener('change',async()=>{
+    const all=[...pick.files];
+    const okType=/\.(jpe?g|png|webp|heic|heif|pdf)$/i,MAX=20*1024*1024;
+    const rel=(f)=>f.webkitRelativePath||f.name;
+    const usable=all.filter((f)=>okType.test(f.name)&&!/(^|\/)Done\//.test(rel(f)));
+    const tooBig=usable.filter((f)=>f.size>MAX);
+    const files=usable.filter((f)=>f.size<=MAX).sort((a,b)=>rel(a).localeCompare(rel(b),undefined,{numeric:true}));
+    const skipped=all.length-usable.length;
+    if(!files.length){out.textContent='No receipt photos or PDFs found in that folder.';pick.value='';return}
+    if(!confirm('Upload '+files.length+' file'+(files.length===1?'':'s')+' from this folder? Each one is read and added as a receipt. Duplicates are skipped.')){pick.value='';return}
+    btn.disabled=true;
+    const tally={ingested:0,duplicate:0,failed:0},problems=[];
+    const BATCH=15;
+    for(let i=0;i<files.length;i+=BATCH){
+      const batch=files.slice(i,i+BATCH);
+      out.textContent='Uploading '+Math.min(i+BATCH,files.length)+' of '+files.length+'... please keep this page open.';
+      const fd=new FormData();
+      fd.append('mode','auto');
+      fd.append('mtimes',JSON.stringify(batch.map((f)=>f.lastModified)));
+      batch.forEach((f)=>fd.append('files',f,f.name));
+      try{
+        const res=await api('receipts/inbox',{method:'POST',body:fd});
+        (res.groups||[]).forEach((g)=>{
+          if(g.status==='ingested') tally.ingested++;
+          else if(g.status==='duplicate') tally.duplicate++;
+          else{tally.failed++;problems.push((g.files||[]).join(', ')+': '+(g.error||'could not be read'))}
+        });
+      }catch(e){tally.failed+=batch.length;problems.push(batch.length+' files ('+batch[0].name+' ...): '+e.message)}
+    }
+    tooBig.forEach((f)=>problems.push(f.name+': larger than 20 MB, not uploaded'));
+    let msg='Done. '+tally.ingested+' new receipt'+(tally.ingested===1?'':'s')+', '+tally.duplicate+' already in the system'+(tally.failed?', '+tally.failed+' failed':'')+'.';
+    if(skipped) msg+=' '+skipped+' other file'+(skipped===1?'':'s')+' (not photos or PDFs) '+(skipped===1?'was':'were')+' ignored.';
+    out.innerHTML=esc(msg)+(problems.length?'<ul>'+problems.map((p)=>'<li>'+esc(p)+'</li>').join('')+'</ul>':'');
+    pick.value='';btn.disabled=false;
+    Promise.all([loadDashboard(),loadTransactions(),loadReceiptInbox()]).catch(console.error);
+  });
+}
+
 function renderMailSettings(){
   const from=$('#settingsMailFrom'),to=$('#settingsAlertTo');
   if(from) from.value=bootstrap.mail_from||'';
@@ -596,6 +638,7 @@ function wireStaticControls(){
   });
   const monthEl=$('#month');
   if(monthEl){monthEl.value=new Date().toISOString().slice(0,7);monthEl.addEventListener('change',()=>Promise.all([loadDashboard(),loadTransactions()]));}
+  setupFolderUpload();
   if($('#refresh')) $('#refresh').addEventListener('click',()=>Promise.all([loadDashboard(),loadTransactions(),loadReceiptInbox()]));
   if($('#runSystemCheck')) $('#runSystemCheck').addEventListener('click',()=>runSystemCheck().catch((e)=>{console.error(e);toast('System check failed to run');}));
   if($('#txFilter')) $('#txFilter').addEventListener('change',renderTransactions);
