@@ -776,6 +776,20 @@ test("correct login sets a session cookie that authenticates subsequent requests
   assert.equal(authed.status, 200);
 });
 
+test("pasted login with stray spaces/newline still signs in; wrong password still fails", async () => {
+  const post = (body) => fetch(BASE + "/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body,
+    redirect: "manual",
+  });
+  const ok = await post("username=%20Test%20&password=test%20%0A");
+  assert.equal(ok.status, 302);
+  assert.match(ok.headers.get("set-cookie"), /^ccc_session=/);
+  const bad = await post("username=test&password=%20tes%20");
+  assert.equal(bad.status, 401);
+});
+
 test("Basic Auth still works for API clients that skip the login page", async () => {
   const res = await apiFetch("/api/bootstrap");
   assert.equal(res.status, 200);

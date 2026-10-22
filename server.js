@@ -77,7 +77,9 @@ function loginPage({error}={}){
     <label for="u">Username</label>
     <input id="u" name="username" autocomplete="username" autocapitalize="off" autocorrect="off" spellcheck="false" autofocus>
     <label for="p">Password</label>
-    <input id="p" name="password" type="password" autocomplete="current-password">
+    <div style="position:relative"><input id="p" name="password" type="password" autocomplete="current-password" style="padding-right:64px">
+    <button type="button" id="show" aria-label="Show password" style="position:absolute;right:6px;top:6px;width:auto;padding:6px 8px;font-size:11px;background:none;color:#1b5a82"
+      onclick="var p=document.getElementById('p'),h=p.type==='password';p.type=h?'text':'password';this.textContent=h?'Hide':'Show';this.setAttribute('aria-label',h?'Hide password':'Show password')">Show</button></div>
     <button type="submit">Sign in</button>
   </form>
   </body></html>`;
@@ -106,8 +108,10 @@ app.post("/login",(req,res)=>{
   const {username,password}=req.body||{};
   // Username isn't a secret, so tolerate the phone-keyboard auto-capitalized
   // first letter that broke the captain's own login attempt (2026-09-27).
-  // Password stays case-sensitive.
-  if(String(username||"").toLowerCase()!==String(user).toLowerCase()||password!==pass)return res.status(401).type("html").send(loginPage({error:"Incorrect username or password."}));
+  // Password stays case-sensitive. Both sides are trimmed: a pasted saved
+  // password often carries a trailing space or newline (2026-10-14).
+  const t=s=>String(s||"").trim();
+  if(t(username).toLowerCase()!==t(user).toLowerCase()||t(password)!==t(pass))return res.status(401).type("html").send(loginPage({error:"Incorrect username or password."}));
   const token=signSession(user);
   res.cookie("ccc_session",token,{httpOnly:true,secure:req.secure,sameSite:"lax",maxAge:SESSION_MAX_AGE_MS});
   res.redirect("/");
